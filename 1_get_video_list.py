@@ -95,10 +95,12 @@ def main():
         
         for item in video_response['items']:
             snippet = item.get('snippet', {})
+            published_at = snippet.get('publishedAt', '')
             all_video_details.append({
                 'url': f"https://www.youtube.com/watch?v={item['id']}",
                 'title': snippet.get('title', ''),
                 'description': snippet.get('description', '').replace('\n', ' '), # Replace newlines
+                'publish_date': published_at.split('T')[0] if published_at else '',
                 'duration': parse_duration(item.get('contentDetails', {}).get('duration', '')),
                 'downloaded': 'false' # As requested
             })
@@ -107,7 +109,7 @@ def main():
     # 4. Write all data to the CSV file
     print(f"Writing data to {CSV_FILENAME}...")
     with open(CSV_FILENAME, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['url', 'title', 'description', 'duration', 'downloaded']
+        fieldnames = ['url', 'title', 'description', 'publish_date', 'duration', 'downloaded']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         writer.writeheader()

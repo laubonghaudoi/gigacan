@@ -1,6 +1,7 @@
 .venv*
 *.env
 AGENTS.md
+.DS_Store
 
 __pycache__/
 *pyc
@@ -17,6 +18,7 @@ __pycache__/
 
 *.mkv
 *.mp4
+*.part
 
 *.vtt
 *.srt

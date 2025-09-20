@@ -60,7 +60,7 @@ def download_worker(task_data):
     return None
 
 def main():
-    csv_file = 'legco.csv'
+    csv_file = 'legco_20250920.csv'
     try:
         df = pd.read_csv(csv_file)
     except FileNotFoundError:
