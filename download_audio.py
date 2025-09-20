@@ -2,6 +2,8 @@ import subprocess
 import pandas as pd
 from urllib.parse import urlparse, parse_qs
 import os
+from multiprocessing import Pool
+
 
 def get_video_id(url):
     """
@@ -44,6 +46,19 @@ def download_audio(video_id, url):
         print("yt-dlp not found. Please ensure it is installed and in your PATH.")
         return False
 
+def download_worker(task_data):
+    """
+    Worker function to download audio for a given URL and return the index for updating.
+    """
+    index, url = task_data
+    video_id = get_video_id(url)
+    if video_id:
+        if download_audio(video_id, url):
+            return index
+    else:
+        print(f"Could not extract video ID from URL: {url}")
+    return None
+
 def main():
     csv_file = 'legco.csv'
     try:
@@ -52,21 +67,32 @@ def main():
         print(f"Error: {csv_file} not found.")
         return
 
+    tasks = []
     for index, row in df.iterrows():
         if not row['downloaded']:
-            url = row['url']
-            video_id = get_video_id(url)
-            
-            if video_id:
-                success = download_audio(video_id, url)
-                if success:
-                    df.loc[index, 'downloaded'] = True
-                    # Save after each successful download to prevent data loss
-                    df.to_csv(csv_file, index=False)
-            else:
-                print(f"Could not extract video ID from URL: {url}")
+            tasks.append((index, row['url']))
 
-    print("All videos have been processed.")
+    if not tasks:
+        print("All videos have already been processed.")
+        return
+        
+    print(f"Starting download of {len(tasks)} videos using 8 processes...")
+
+    with Pool(processes=8) as pool:
+        results = pool.map(download_worker, tasks)
+
+    successful_downloads = 0
+    for index in results:
+        if index is not None:
+            df.loc[index, 'downloaded'] = True
+            successful_downloads += 1
+
+    if successful_downloads > 0:
+        df.to_csv(csv_file, index=False)
+        print(f"Updated {csv_file} with {successful_downloads} new downloads.")
+
+    print("All processing is complete.")
+
 
 if __name__ == "__main__":
     main()
