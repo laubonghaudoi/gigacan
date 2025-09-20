@@ -18,23 +18,24 @@ def get_video_id(url):
             return video_id[0]
     return None
 
+
 def download_audio(video_id, url):
     """
     Downloads audio from a YouTube URL and converts it to 16kHz opus format.
     The filename will be the video ID.
     """
     output_filename = os.path.join('download', f'{video_id}.opus')
-    
+
     command = [
         'yt-dlp',
         '-o', output_filename,
         '-x',
         '--audio-format', 'opus',
         '--postprocessor-args', '-ar 16000',
-        '--cookies', 'cookies.txt',
+        '--cookies-from-browser', 'chrome',
         url
     ]
-    
+
     try:
         subprocess.run(command, check=True)
         print(f"Audio downloaded and converted successfully: {output_filename}")
@@ -45,6 +46,7 @@ def download_audio(video_id, url):
     except FileNotFoundError:
         print("yt-dlp not found. Please ensure it is installed and in your PATH.")
         return False
+
 
 def download_worker(task_data):
     """
@@ -58,6 +60,7 @@ def download_worker(task_data):
     else:
         print(f"Could not extract video ID from URL: {url}")
     return None
+
 
 def main():
     csv_file = 'legco_20250920.csv'
@@ -75,7 +78,7 @@ def main():
     if not tasks:
         print("All videos have already been processed.")
         return
-        
+
     print(f"Starting download of {len(tasks)} videos using 8 processes...")
 
     with Pool(processes=8) as pool:
