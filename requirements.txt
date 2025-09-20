@@ -1,0 +1,7 @@
+silero-vad
+dashscope
+python-ffmpeg
+yt-dlp
+matplotlib
+ipywidgets
+qwen3-asr-toolkit
