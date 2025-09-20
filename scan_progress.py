@@ -39,9 +39,12 @@ def scan_and_update_progress():
 
     # 1. Get a set of video IDs from the filenames in the download directory
     try:
-        downloaded_files = os.listdir(DOWNLOAD_DIR)
-        downloaded_ids = {os.path.splitext(f)[0] for f in downloaded_files if f.endswith('.opus')}
-        print(f"Found {len(downloaded_ids)} downloaded audio files.")
+        downloaded_ids = set()
+        for root, _, files in os.walk(DOWNLOAD_DIR):
+            for file in files:
+                if file.endswith('.opus'):
+                    downloaded_ids.add(os.path.splitext(file)[0])
+        print(f"Found {len(downloaded_ids)} downloaded audio files across all subdirectories.")
     except Exception as e:
         print(f"Error reading directory '{DOWNLOAD_DIR}': {e}")
         return
@@ -56,15 +59,19 @@ def scan_and_update_progress():
         print(f"Error reading CSV file '{CSV_FILE}': {e}")
         return
 
-    # 3. Iterate and update the 'downloaded' status
+    # 3. Iterate and update status, and count missing files
     updates_made = 0
+    missing_files_count = 0
     for index, row in df.iterrows():
-        # Only check rows that are currently marked as not downloaded
-        if row['downloaded'] is False:
-            video_id = get_video_id(row['url'])
-            if video_id and video_id in downloaded_ids:
-                df.loc[index, 'downloaded'] = True
-                updates_made += 1
+        video_id = get_video_id(row['url'])
+        is_downloaded = row['downloaded']
+
+        if is_downloaded:
+            if video_id not in downloaded_ids:
+                missing_files_count += 1
+        elif video_id and video_id in downloaded_ids:
+            df.loc[index, 'downloaded'] = True
+            updates_made += 1
 
     # 4. Save the updated DataFrame back to the CSV
     if updates_made > 0:
@@ -76,6 +83,9 @@ def scan_and_update_progress():
             print(f"Error saving updated CSV file: {e}")
     else:
         print("No updates needed. CSV file is already in sync with the download folder.")
+
+    if missing_files_count > 0:
+        print(f"Warning: Found {missing_files_count} files marked as 'True' in the CSV but not found in the download folder.")
 
 if __name__ == "__main__":
     scan_and_update_progress()
