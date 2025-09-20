@@ -70,8 +70,13 @@ def main():
         print(f"Error: {csv_file} not found.")
         return
 
+    # Sort the DataFrame by 'publish_date' in descending order
+    df['publish_date'] = pd.to_datetime(df['publish_date'])
+    df = df.sort_values(by='publish_date', ascending=False)
+
     tasks = []
     for index, row in df.iterrows():
+        # Check if 'downloaded' is False or the column doesn't exist/is NaN
         if not row['downloaded']:
             tasks.append((index, row['url']))
 
