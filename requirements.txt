@@ -4,4 +4,5 @@ python-ffmpeg
 yt-dlp
 matplotlib
 ipywidgets
-qwen3-asr-toolkit
+huggingface_hub
+datasets
