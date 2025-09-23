@@ -1,8 +1,8 @@
 silero-vad
-dashscope
 python-ffmpeg
 yt-dlp
 matplotlib
 ipywidgets
 huggingface_hub
 datasets
+google-api-python-client

@@ -96,10 +96,17 @@ def main():
         for item in video_response['items']:
             snippet = item.get('snippet', {})
             published_at = snippet.get('publishedAt', '')
+            description = snippet.get('description', '')
+            # Preserve intentional newlines while encoding them safely for CSV consumers
+            description_safe = (description
+                                 .replace('\r\n', '\\n')
+                                 .replace('\n', '\\n')
+                                 .replace('\r', '\\n'))
+
             all_video_details.append({
                 'url': f"https://www.youtube.com/watch?v={item['id']}",
                 'title': snippet.get('title', ''),
-                'description': snippet.get('description', '').replace('\n', ' '), # Replace newlines
+                'description': description_safe,
                 'publish_date': published_at.split('T')[0] if published_at else '',
                 'duration': parse_duration(item.get('contentDetails', {}).get('duration', '')),
                 'downloaded': 'false' # As requested
