@@ -10,12 +10,15 @@ VAD 模型用 silero-vad，語音識別用 [Qwen3 ASR](https://qwen.ai/blog?id=4
 
 ### 1 下載影片
 
-呢一步要反覆試錯，因為youtube 下載經常會中斷。而且需要好多儲存空間。首先要確定目標頻道或者播放清單，然後針對
+呢一步要反覆試錯，因為 yt-dlp 下載經常會中斷。而且需要好多儲存空間，所以要經常𥄫住然後人手重試。首先要確定目標頻道或者播放清單，然後針對
 
-1. 跑`1_get_video_list.py` 將指定頻道或者播放清單入面所有影片嘅 metadata 爬落一個 csv 文件度，呢個文件亦都會用於登記下載進度。
+1. 準備好 GCP 嘅 YouTube API key，然後跑`1_get_video_list.py` 將指定頻道或者播放清單入面所有影片嘅 metadata 爬落一個 csv 文件度，呢個文件亦都會用於登記下載進度。
 1. 跑 `2_download_audio.py`，會按照上面嘅 csv 記錄嘅進度，將未下載嘅片下載落`download/`並轉化成 16kHz OPUS 格式。
-    1. 因為下載過程會經常因為 youtube 反爬蟲、空間唔夠等等意外中斷，所以需要有呢個 csv 嚟記錄進度。如果下載中斷，可以跑 `scan_progress.py`，會自動檢查 `download/` 入面邊啲已經下載咗邊啲未下載，然後更新個 csv
+    1. 因為下載過程會經常因為 YouTube 反爬蟲、空間唔夠等等意外中斷，所以需要有呢個 csv 嚟記錄進度。如果下載中斷，可以跑 `scan_progress.py`，會自動檢查 `download/` 入面邊啲已經下載咗邊啲未下載，然後更新個 csv 將啲已經下載且轉碼成功嘅登記為 `downloaded=True`。
     1. 每次中斷後重新跑 `2_download_audio.py` 都會自動讀取個 csv，按照 `downloaded`嗰列 `false` 嘅嚟下載。
+    1. 下載完之後跑個 `2_organize_downloads.py` 會自動將 `download/` 入面下載好嘅音頻按照年份分類。
+1. 全部下載完成之後，跑一次 `2_check_audio_integrity.py`，會自動按照個 csv 檢查一次所有下載好嘅 OPUS。如果遇到個長度唔對應嘅，就會刪除呢條 OPUS 然後喺 csv 入面標記`downloaded=False`
+1. 再跑多次 `2_download_audio.py`
 
 ## 2 轉寫字幕
 

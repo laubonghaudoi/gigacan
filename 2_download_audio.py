@@ -4,6 +4,11 @@ from urllib.parse import urlparse, parse_qs
 import os
 from multiprocessing import Pool
 
+# --- CONFIGURATION ---
+CSV_FILE = 'legco_20250920.csv'
+DOWNLOAD_DIR = 'download/'
+# --- END CONFIGURATION ---
+
 
 def get_video_id(url):
     """
@@ -24,7 +29,7 @@ def download_audio(video_id, url):
     Downloads audio from a YouTube URL and converts it to 16kHz opus format.
     The filename will be the video ID.
     """
-    output_filename = os.path.join('download', f'{video_id}.opus')
+    output_filename = os.path.join(DOWNLOAD_DIR, f'{video_id}.opus')
 
     command = [
         'yt-dlp',
@@ -63,7 +68,7 @@ def download_worker(task_data):
 
 
 def main():
-    csv_file = 'legco_20250920.csv'
+    csv_file = CSV_FILE
     try:
         df = pd.read_csv(csv_file)
     except FileNotFoundError:
