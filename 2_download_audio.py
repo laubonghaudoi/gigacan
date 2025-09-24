@@ -37,7 +37,7 @@ def download_audio(video_id, url):
         '-x',
         '--audio-format', 'opus',
         '--postprocessor-args', '-ar 16000',
-        '--cookies-from-browser', 'chrome',
+        '--cookies', './cookies.txt',
         url
     ]
 

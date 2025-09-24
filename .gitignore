@@ -5,6 +5,7 @@ AGENTS.md
 
 __pycache__/
 *pyc
+*.ipynb_checkpoints/
 
 *.opus
 *.wav

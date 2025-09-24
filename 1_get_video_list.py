@@ -4,7 +4,7 @@ from googleapiclient.discovery import build
 
 # --- CONFIGURATION ---
 # 1. Make sure to set the YOUTUBE_API_KEY environment variable.
-API_KEY = "AIzaSyDQXvc0vaJ700i09zHnajh3z5f4U7BLV5A"
+API_KEY = ""
 
 # 2. The username of the channel
 CHANNEL_USERNAME = "@legcogovhk"
