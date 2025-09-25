@@ -17,8 +17,19 @@ VAD 模型用 silero-vad，語音識別用 [Qwen3 ASR](https://qwen.ai/blog?id=4
     1. 因為下載過程會經常因為 YouTube 反爬蟲、空間唔夠等等意外中斷，所以需要有呢個 csv 嚟記錄進度。如果下載中斷，可以跑 `scan_progress.py`，會自動檢查 `download/` 入面邊啲已經下載咗邊啲未下載，然後更新個 csv 將啲已經下載且轉碼成功嘅登記為 `downloaded=True`。
     1. 每次中斷後重新跑 `2_download_audio.py` 都會自動讀取個 csv，按照 `downloaded`嗰列 `false` 嘅嚟下載。
     1. 下載完之後跑個 `2_organize_downloads.py` 會自動將 `download/` 入面下載好嘅音頻按照年份分類。
-1. 全部下載完成之後，跑一次 `2_check_audio_integrity.py`，會自動按照個 csv 檢查一次所有下載好嘅 OPUS。如果遇到個長度唔對應嘅，就會刪除呢條 OPUS 然後喺 csv 入面標記`downloaded=False`
-1. 再跑多次 `2_download_audio.py`
+1. 全部下載完成之後，跑一次
+    ```bash
+    python3 2_check_audio_integrity.py download/ legco_20250920.csv --cleanup --auto-yes
+    ```
+    會自動按照個 csv 檢查一次所有下載好嘅 OPUS。如果遇到個長度唔對應嘅，就會刪除呢條 OPUS 然後喺 csv 入面標記`downloaded=False`
+1. 再重複跑 `2_download_audio.py`，直至將所有 opus 都下載齊為止。
+1. 跑 `3_generate_metadata.py`，會生成一個 `metadata.csv`，作為 HF 上面數據集嘅超數據。
+1. 按照 `HF_UPLOAD_STEPS.md` 入面步驟跑
+    ```bash
+    python 3_make_webdataset.py metadata.csv webdataset --dry-run
+    ```
+    會列出總共需要分成幾多個 tar 上傳到 HF 做數據集。
+1. 
 
 ## 2 轉寫字幕
 

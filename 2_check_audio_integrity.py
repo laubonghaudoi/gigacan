@@ -165,10 +165,9 @@ def check_file_worker(filepath_with_index, expected_durations):
         # Check duration mismatch if we have expected duration
         if expected_duration:
             duration_diff = abs(actual_duration - expected_duration)
-            duration_diff_percent = (duration_diff / expected_duration) * 100
 
-            if duration_diff_percent > 10:  # More than 10% difference
-                return (i, filepath, 'truncated', actual_duration, expected_duration, duration_diff_percent)
+            if duration_diff > 1.0:  # More than 1 second difference
+                return (i, filepath, 'truncated', actual_duration, expected_duration, duration_diff)
             else:
                 return (i, filepath, 'valid', actual_duration, expected_duration, None)
         elif actual_duration < 60:  # Less than 1 minute is suspicious if no expected duration
@@ -177,7 +176,12 @@ def check_file_worker(filepath_with_index, expected_durations):
             return (i, filepath, 'valid', actual_duration, expected_duration, None)
 
 
-def check_download_directory(download_dir=DOWNLOAD_DIR, csv_file=CSV_FILE, summary_only=False):
+def check_download_directory(
+    download_dir=DOWNLOAD_DIR,
+    csv_file=CSV_FILE,
+    summary_only=False,
+    processes=8,
+):
     """
     Check all opus files in the download directory and its subdirectories.
     Compare with expected durations from CSV file.
@@ -203,7 +207,10 @@ def check_download_directory(download_dir=DOWNLOAD_DIR, csv_file=CSV_FILE, summa
         print("No opus files found.")
         return
 
-    print(f"Found {len(opus_files)} opus files. Checking integrity using 8 parallel processes...\n")
+    proc_label = "process" if processes == 1 else "processes"
+    print(
+        f"Found {len(opus_files)} opus files. Checking integrity using {processes} parallel {proc_label}...\n"
+    )
 
     # Prepare files with indices for parallel processing
     files_with_indices = list(enumerate(opus_files, 1))
@@ -221,7 +228,7 @@ def check_download_directory(download_dir=DOWNLOAD_DIR, csv_file=CSV_FILE, summa
 
     print("Processing files...")
 
-    with Pool(processes=8) as pool:
+    with Pool(processes=processes) as pool:
         if TQDM_AVAILABLE:
             # Use tqdm progress bar
             with tqdm(total=len(files_with_indices), desc="Checking files", unit="file",
@@ -251,33 +258,44 @@ def check_download_directory(download_dir=DOWNLOAD_DIR, csv_file=CSV_FILE, summa
         print(f"\n✓ Checked {len(results)} files. Found {problem_count} problematic files.")
 
     # Process results
-    if not summary_only:
-        print("\nDetailed Results:")
-        print("-" * 80)
+    show_details = not summary_only
+    detail_lines = []
 
     for i, filepath, status, actual_duration, expected_duration, extra_info in results:
         video_id = os.path.splitext(os.path.basename(filepath))[0]
 
         if status == 'corrupted':
             corrupted_files.append((filepath, extra_info))
-            if not summary_only:
-                print(f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ❌ CORRUPTED - {extra_info}")
+            if show_details:
+                detail_lines.append(f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ❌ CORRUPTED - {extra_info}")
         elif status == 'truncated':
             truncated_files.append((filepath, actual_duration, expected_duration, extra_info))
-            if not summary_only:
-                print(f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ⚠️  TRUNCATED - Expected {format_duration(expected_duration)}, got {format_duration(actual_duration)} ({extra_info:.1f}% off)")
+            if show_details:
+                diff_seconds = extra_info
+                diff_percent = ((diff_seconds / expected_duration) * 100
+                                if expected_duration else None)
+                diff_text = f"{diff_seconds:.1f}s off"
+                if diff_percent is not None:
+                    diff_text += f", {diff_percent:.1f}% off"
+                detail_lines.append(
+                    f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ⚠️  TRUNCATED - Expected {format_duration(expected_duration)}, "
+                    f"got {format_duration(actual_duration)} ({diff_text})"
+                )
         elif status == 'suspicious':
             suspicious_files.append((filepath, actual_duration))
-            if not summary_only:
-                print(f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ⚠️  SUSPICIOUS - Very short ({format_duration(actual_duration)})")
+            if show_details:
+                detail_lines.append(
+                    f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ⚠️  SUSPICIOUS - Very short ({format_duration(actual_duration)})"
+                )
         else:  # valid
             valid_files += 1
             total_duration += actual_duration
-            if not summary_only:
-                if expected_duration:
-                    print(f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ✓ OK ({format_duration(actual_duration)})")
-                else:
-                    print(f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ✓ OK ({format_duration(actual_duration)}) [No expected duration]")
+
+    if show_details and detail_lines:
+        print("\nDetailed Results:")
+        print("-" * 80)
+        for line in detail_lines:
+            print(line)
 
     # Summary
     print("\n" + "=" * 60)
@@ -300,9 +318,16 @@ def check_download_directory(download_dir=DOWNLOAD_DIR, csv_file=CSV_FILE, summa
 
     if truncated_files:
         print("\n⚠️  TRUNCATED FILES (significant duration mismatch - likely interrupted):")
-        for filepath, actual, expected, diff_percent in truncated_files:
+        for filepath, actual, expected, diff_seconds in truncated_files:
             print(f"  - {filepath}")
-            print(f"    Expected: {format_duration(expected)}, Got: {format_duration(actual)} ({diff_percent:.1f}% off)")
+            diff_percent = ((diff_seconds / expected) * 100 if expected else None)
+            diff_text = f"{diff_seconds:.1f}s off"
+            if diff_percent is not None:
+                diff_text += f", {diff_percent:.1f}% off"
+            print(
+                f"    Expected: {format_duration(expected)}, Got: {format_duration(actual)} "
+                f"({diff_text})"
+            )
 
     if suspicious_files:
         print("\n⚠️  SUSPICIOUS FILES (very short, no expected duration):")
@@ -463,14 +488,28 @@ def main():
         action='store_true',
         help='Show only summary without detailed file-by-file results'
     )
+    parser.add_argument(
+        '--processes',
+        type=int,
+        default=8,
+        help='Number of parallel processes to use (default: 8)'
+    )
 
     args = parser.parse_args()
+
+    if args.processes < 1:
+        parser.error('--processes must be at least 1')
 
     print(f"Using download directory: {args.download_dir}")
     print(f"Using CSV file: {args.csv_file}\n")
 
     # Run the integrity check
-    problematic_files, video_ids = check_download_directory(args.download_dir, args.csv_file, args.summary_only)
+    problematic_files, video_ids = check_download_directory(
+        download_dir=args.download_dir,
+        csv_file=args.csv_file,
+        summary_only=args.summary_only,
+        processes=args.processes,
+    )
 
     # If cleanup is requested and there are problematic files
     if args.cleanup and problematic_files:
