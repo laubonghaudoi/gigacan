@@ -4,7 +4,7 @@ import shutil
 from urllib.parse import urlparse, parse_qs
 
 # --- CONFIGURATION ---
-CSV_FILE = 'legco_20250920.csv'
+CSV_FILE = 'legco.csv'
 DOWNLOAD_DIR = 'download/'
 # --- END CONFIGURATION ---
 

@@ -19,7 +19,7 @@ VAD 模型用 silero-vad，語音識別用 [Qwen3 ASR](https://qwen.ai/blog?id=4
     1. 下載完之後跑個 `2_organize_downloads.py` 會自動將 `download/` 入面下載好嘅音頻按照年份分類。
 1. 全部下載完成之後，跑一次
     ```bash
-    python3 2_check_audio_integrity.py download/ legco_20250920.csv --cleanup --auto-yes
+    python3 2_check_audio_integrity.py download/ legco.csv --cleanup --auto-yes
     ```
     會自動按照個 csv 檢查一次所有下載好嘅 OPUS。如果遇到個長度唔對應嘅，就會刪除呢條 OPUS 然後喺 csv 入面標記`downloaded=False`
 1. 再重複跑 `2_download_audio.py`，直至將所有 opus 都下載齊為止。
@@ -28,7 +28,7 @@ VAD 模型用 silero-vad，語音識別用 [Qwen3 ASR](https://qwen.ai/blog?id=4
     ```bash
     python 3_make_webdataset.py metadata.csv webdataset --dry-run
     ```
-    會列出總共需要分成幾多個 tar 上傳到 HF 做數據集。
+    會列出總共需要分成幾多個 tar 上傳到 HF 做數據集。確定冇問題之後刪去 `--dry-run` 再跑多次。
 1. 
 
 ## 2 轉寫字幕
@@ -51,3 +51,20 @@ python3 2_vtt.py
 # 用生成嘅 vtt 字幕切分
 python3
 ```
+
+
+
+
+HF_XET_CACHE=/home/jupyter/xet-cache python 4_upload_to_hf.py --year 2025 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2024 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2023 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2022 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2021 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2020 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2019 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2018 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2017 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2016 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2015 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2014 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \
+python 4_upload_to_hf.py --year 2013 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \

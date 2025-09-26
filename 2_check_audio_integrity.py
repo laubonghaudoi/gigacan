@@ -20,7 +20,7 @@ except ImportError:
     TQDM_AVAILABLE = False
 
 # --- CONFIGURATION ---
-CSV_FILE = 'legco_20250920.csv'
+CSV_FILE = 'legco.csv'
 DOWNLOAD_DIR = 'download/'
 # --- END CONFIGURATION ---
 
