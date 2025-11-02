@@ -7,13 +7,15 @@ import argparse
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import cast
 from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
+from pandas import DataFrame
 from tqdm import tqdm
 
 
@@ -22,7 +24,7 @@ DEFAULT_OUTPUT = Path("metadata.csv")
 DEFAULT_DOWNLOAD_DIR = Path("download")
 
 
-@dataclass
+@dataclass(slots=True)
 class MetadataRow:
     """Container for a single Hugging Face metadata entry."""
 
@@ -35,7 +37,7 @@ class MetadataRow:
     duration_seconds: int
 
 
-@dataclass
+@dataclass(slots=True)
 class CandidateEntry:
     video_id: str
     audio_path: Path
@@ -44,7 +46,18 @@ class CandidateEntry:
     description: str
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass(slots=True)
+class CliArgs:
+    source: Path
+    download_dir: Path
+    output: Path
+    jobs: int | None
+
+
+Diagnostics = dict[str, list[str]]
+
+
+def parse_args() -> CliArgs:
     """Configure and parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description=(
@@ -52,25 +65,25 @@ def parse_args() -> argparse.Namespace:
             "Only rows with downloaded audio and a discoverable .opus file are exported."
         )
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         '--source',
         type=Path,
         default=DEFAULT_SOURCE,
         help=f"Source CSV file to read (default: {DEFAULT_SOURCE})"
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         '--download-dir',
         type=Path,
         default=DEFAULT_DOWNLOAD_DIR,
         help=f"Directory that stores downloaded audio (default: {DEFAULT_DOWNLOAD_DIR})"
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         '--output',
         type=Path,
         default=DEFAULT_OUTPUT,
         help=f"Destination CSV path (default: {DEFAULT_OUTPUT})"
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         '--jobs',
         type=_parse_jobs,
         default=None,
@@ -79,7 +92,17 @@ def parse_args() -> argparse.Namespace:
             "Use 0 to auto-detect, 1 to force sequential behaviour."
         ),
     )
-    return parser.parse_args()
+    namespace = parser.parse_args()
+    source_value = cast(Path, namespace.source)
+    download_dir_value = cast(Path, namespace.download_dir)
+    output_value = cast(Path, namespace.output)
+    jobs_value = cast(int | None, namespace.jobs)
+    return CliArgs(
+        source=source_value,
+        download_dir=download_dir_value,
+        output=output_value,
+        jobs=jobs_value,
+    )
 
 
 def _parse_jobs(value: str) -> int:
@@ -205,7 +228,7 @@ def probe_audio_durations(paths: Sequence[Path], jobs: int | None) -> tuple[dict
             failures.append(path)
         else:
             results[path] = (seconds, format_seconds_hms(seconds))
-        progress.update(1)
+        _ = progress.update(1)
 
     if worker_count == 1:
         for path in paths:
@@ -217,7 +240,7 @@ def probe_audio_durations(paths: Sequence[Path], jobs: int | None) -> tuple[dict
                 failures.append(path)
                 continue
             _record_result(path, seconds)
-        progress.close()
+        _ = progress.close()
         return results, failures
 
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
@@ -237,7 +260,7 @@ def probe_audio_durations(paths: Sequence[Path], jobs: int | None) -> tuple[dict
                 continue
             _record_result(path, seconds)
 
-    progress.close()
+    _ = progress.close()
 
     return results, failures
 
@@ -247,13 +270,13 @@ def _probe_path_seconds(path_str: str) -> int | None:
 
 
 def build_rows(
-    df: pd.DataFrame,
+    df: DataFrame,
     download_dir: Path,
     jobs: int | None,
-) -> tuple[list[MetadataRow], dict[str, list[str]]]:
+) -> tuple[list[MetadataRow], Diagnostics]:
     """Create metadata rows and collect diagnostics about skipped entries."""
     rows: list[MetadataRow] = []
-    diagnostics = {
+    diagnostics: Diagnostics = {
         'missing_video_id': [],
         'not_downloaded': [],
         'missing_audio_file': [],
@@ -264,19 +287,21 @@ def build_rows(
     paths_for_probe: list[Path] = []
     video_ids_by_path: dict[Path, list[str]] = {}
 
-    for record in df.itertuples(index=False):
-        url = getattr(record, 'url', None)
-        video_id = get_video_id(url)
+    records = cast(list[dict[str, object]], df.to_dict(orient="records"))
+
+    for record in records:
+        url_value = cast(str | float | None, record.get('url'))
+        video_id = get_video_id(url_value)
         if not video_id:
-            diagnostics['missing_video_id'].append(str(url))
+            diagnostics['missing_video_id'].append(str(url_value))
             continue
 
-        downloaded_value = getattr(record, 'downloaded', None)
+        downloaded_value = cast(object, record.get('downloaded'))
         if not normalise_downloaded(downloaded_value):
             diagnostics['not_downloaded'].append(video_id)
             continue
 
-        publish_date_value = getattr(record, 'publish_date', None)
+        publish_date_value = cast(object, record.get('publish_date'))
         audio_path = resolve_audio_path(download_dir, video_id, publish_date_value)
         if audio_path is None:
             diagnostics['missing_audio_file'].append(video_id)
@@ -291,8 +316,8 @@ def build_rows(
                 video_id=video_id,
                 audio_path=audio_path,
                 publish_date=str(publish_date_value) if publish_date_value is not None else '',
-                title=str(getattr(record, 'title', '') or ''),
-                description=str(getattr(record, 'description', '') or ''),
+                title=str(record.get('title', '') or ''),
+                description=str(record.get('description', '') or ''),
             )
         )
 
@@ -320,7 +345,7 @@ def build_rows(
     return rows, diagnostics
 
 
-def report_diagnostics(rows: Sequence[MetadataRow], diagnostics: dict[str, list[str]]) -> None:
+def report_diagnostics(rows: Sequence[MetadataRow], diagnostics: Diagnostics) -> None:
     """Emit a short summary of the conversion process."""
     print(f"✓ Prepared {len(rows)} metadata entries.")
     for key, items in diagnostics.items():
@@ -347,7 +372,7 @@ def main() -> None:
     if not rows:
         raise SystemExit("No metadata rows generated; check diagnostics and input files.")
 
-    data = [row.__dict__ for row in rows]
+    data = [asdict(row) for row in rows]
     metadata_df = pd.DataFrame(data)
     metadata_df.to_csv(output, index=False)
 

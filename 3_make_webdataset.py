@@ -8,11 +8,13 @@ import csv
 import io
 import json
 import os
+import sys
 import tarfile
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-import sys
+from typing import cast
 
 
 @dataclass(slots=True)
@@ -25,19 +27,31 @@ class Sample:
     sort_key: tuple[str, ...]
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass(slots=True)
+class CliArgs:
+    metadata_csv: Path
+    output_dir: Path
+    audio_root: Path | None
+    samples_per_shard: int
+    max_shard_size_mb: float
+    years: tuple[str, ...] | None
+    dry_run: bool
+    jobs: int | None
+
+
+def parse_args() -> CliArgs:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    _ = parser.add_argument(
         "metadata_csv",
         type=Path,
         help="Path to CSV containing audio metadata.",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "output_dir",
         type=Path,
         help="Destination directory for WebDataset shards.",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--audio-root",
         type=Path,
         default=None,
@@ -46,29 +60,29 @@ def parse_args() -> argparse.Namespace:
             " Defaults to metadata CSV parent."
         ),
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--samples-per-shard",
         type=int,
         default=20,
         help="Maximum number of samples per shard (default: 20).",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--max-shard-size-mb",
         type=float,
         default=1500.0,
         help="Maximum shard size in megabytes before rolling over (default: 1500).",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--years",
         nargs="*",
         help="Optional list of years to include (e.g. 2015 2016).",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--dry-run",
         action="store_true",
         help="List planned shards without writing tar files.",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--jobs",
         type=_parse_jobs,
         default=8,
@@ -77,7 +91,25 @@ def parse_args() -> argparse.Namespace:
             "Use 0 to autodetect (default: autodetect)."
         ),
     )
-    return parser.parse_args()
+    namespace = parser.parse_args()
+    metadata_csv_value = cast(Path, namespace.metadata_csv)
+    output_dir_value = cast(Path, namespace.output_dir)
+    audio_root_value = cast(Path | None, namespace.audio_root)
+    years_value = cast(Sequence[str] | None, namespace.years)
+    jobs_value = cast(int | None, namespace.jobs)
+    samples_per_shard_value = cast(int, namespace.samples_per_shard)
+    max_shard_size_value = cast(float, namespace.max_shard_size_mb)
+    dry_run_value = cast(bool, namespace.dry_run)
+    return CliArgs(
+        metadata_csv=metadata_csv_value,
+        output_dir=output_dir_value,
+        audio_root=audio_root_value,
+        samples_per_shard=samples_per_shard_value,
+        max_shard_size_mb=max_shard_size_value,
+        years=tuple(years_value) if years_value else None,
+        dry_run=dry_run_value,
+        jobs=jobs_value,
+    )
 
 
 def _parse_jobs(value: str) -> int:
@@ -87,7 +119,7 @@ def _parse_jobs(value: str) -> int:
     return jobs
 
 
-def load_samples(args: argparse.Namespace) -> dict[str, list[Sample]]:
+def load_samples(args: CliArgs) -> dict[str, list[Sample]]:
     metadata_path = args.metadata_csv
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Metadata CSV not found: {metadata_path}")
@@ -105,7 +137,11 @@ def load_samples(args: argparse.Namespace) -> dict[str, list[Sample]]:
                 warn(f"Skipping row without audio path: {row}")
                 continue
 
-            audio_path = (audio_root / audio_rel).resolve() if not Path(audio_rel).is_absolute() else Path(audio_rel)
+            audio_candidate = Path(audio_rel)
+            if audio_candidate.is_absolute():
+                audio_path = audio_candidate
+            else:
+                audio_path = (audio_root / audio_candidate).resolve()
             if not audio_path.is_file():
                 warn(f"Audio file not found: {audio_path}")
                 continue

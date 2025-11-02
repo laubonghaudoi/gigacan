@@ -1,194 +1,348 @@
 #!/usr/bin/env python3
 """
-Script to check the integrity of downloaded audio files.
-Identifies potentially corrupted or incomplete opus files.
-Compares actual durations with expected durations from the CSV file.
+Check the integrity of downloaded audio files and optionally clean up failures.
 """
 
-import os
+from __future__ import annotations
+
+# pyright: reportMissingTypeStubs=false
+
+import argparse
 import subprocess
 import sys
-import pandas as pd
-from urllib.parse import urlparse, parse_qs
-from multiprocessing import Pool
+from collections.abc import Hashable, Iterable
+from dataclasses import dataclass
 from functools import partial
-import argparse
-try:
+from multiprocessing import Pool
+from pathlib import Path
+from typing import Literal, cast
+from urllib.parse import parse_qs, urlparse
+
+import pandas as pd
+from pandas import DataFrame
+
+try:  # pragma: no cover - optional dependency for progress bars
     from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
 
 # --- CONFIGURATION ---
-CSV_FILE = 'legco.csv'
-DOWNLOAD_DIR = 'download/'
+CSV_FILE = Path("legco.csv")
+DOWNLOAD_DIR = Path("download")
 # --- END CONFIGURATION ---
 
+Status = Literal["valid", "corrupted", "truncated", "suspicious"]
 
-def get_video_id(url):
-    """
-    Extracts the YouTube video ID from a URL.
-    """
-    if pd.isna(url):
+
+@dataclass(slots=True)
+class FileCheckResult:
+    """Outcome of validating a single audio file."""
+
+    index: int
+    path: Path
+    status: Status
+    actual_duration: float
+    expected_duration: float | None
+    detail: float | str | None
+
+
+@dataclass(slots=True)
+class CliArgs:
+    """Parsed command-line arguments with concrete types."""
+
+    download_dir: Path
+    csv_file: Path
+    cleanup: bool
+    auto_yes: bool
+    summary_only: bool
+    processes: int
+
+
+def get_video_id(url: object) -> str | None:
+    """Extract the YouTube video identifier from ``url``."""
+
+    if not isinstance(url, str):
         return None
-    try:
-        if 'youtu.be' in url:
-            return url.split('/')[-1].split('?')[0]
-        parsed_url = urlparse(url)
-        if parsed_url.hostname in ['www.youtube.com', 'youtube.com']:
-            video_id = parse_qs(parsed_url.query).get('v')
-            if video_id:
-                return video_id[0]
-    except (ValueError, AttributeError, TypeError):
-        pass
-    return None
 
-
-def parse_duration_string(duration_str):
-    """
-    Convert duration string from HH:MM:SS to seconds.
-    Returns None if parsing fails.
-    """
-    if pd.isna(duration_str):
+    if "youtu.be" in url:
+        parts = url.rstrip("/").split("/")
+        if parts:
+            candidate = parts[-1].split("?")[0]
+            return candidate or None
         return None
+
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"www.youtube.com", "youtube.com"}:
+        return None
+
+    candidates = parse_qs(parsed.query).get("v")
+    if not candidates:
+        return None
+
+    return candidates[0] or None
+
+
+def parse_duration_string(duration_str: object) -> int | None:
+    """Convert HH:MM:SS duration strings into seconds."""
+
+    if not isinstance(duration_str, str):
+        return None
+
+    parts = duration_str.strip().split(":")
     try:
-        parts = duration_str.split(':')
         if len(parts) == 3:
             hours, minutes, seconds = map(int, parts)
             return hours * 3600 + minutes * 60 + seconds
-        elif len(parts) == 2:
+        if len(parts) == 2:
             minutes, seconds = map(int, parts)
             return minutes * 60 + seconds
-        else:
-            return int(duration_str)
-    except (ValueError, AttributeError):
+        return int(parts[0])
+    except (TypeError, ValueError):
         return None
 
 
-def load_expected_durations(csv_file=CSV_FILE):
+def load_expected_durations(csv_file: Path | str = CSV_FILE) -> dict[str, int]:
     """
-    Load expected durations from CSV file.
-    Returns a dictionary mapping video_id to expected duration in seconds.
+    Load expected durations from the metadata CSV.
+
+    Returns:
+        Mapping of video ID → expected duration in seconds.
     """
+
     try:
         df = pd.read_csv(csv_file)
-        video_durations = {}
-
-        for _, row in df.iterrows():
-            video_id = get_video_id(row['url'])
-            expected_duration = parse_duration_string(row['duration'])
-
-            if video_id and expected_duration:
-                video_durations[video_id] = expected_duration
-
-        return video_durations
-    except (FileNotFoundError, pd.errors.EmptyDataError, KeyError) as e:
-        print(f"Warning: Could not load CSV file: {e}")
+    except FileNotFoundError:
+        print(f"Warning: CSV file {csv_file} not found.")
+        return {}
+    except (pd.errors.EmptyDataError, OSError) as exc:
+        print(f"Warning: Could not load CSV file {csv_file}: {exc}")
         return {}
 
+    expected: dict[str, int] = {}
+    records = df.to_dict(orient="records")
 
-def check_opus_file(filepath):
+    for record in records:
+        video_id = get_video_id(cast(object, record.get("url")))
+        duration = parse_duration_string(cast(object, record.get("duration")))
+        if video_id and duration is not None:
+            expected[video_id] = duration
+
+    return expected
+
+
+def check_opus_file(filepath: Path) -> tuple[bool, float, str | None]:
     """
-    Check if an opus file is valid and complete.
-    Returns (is_valid, duration, error_message)
+    Validate that ``filepath`` contains a playable Opus stream.
+
+    Returns:
+        ``(is_valid, duration_seconds, error_detail)``.
     """
+
+    probe_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(filepath),
+    ]
+
     try:
-        # Use ffprobe to check the file
-        cmd = [
-            'ffprobe',
-            '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            str(filepath)
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        duration = float(result.stdout.strip())
-
-        # Check if duration is reasonable (at least 1 second)
-        if duration < 1.0:
-            return False, duration, "Duration too short (< 1 second)"
-
-        # Additional check: try to get format info
-        cmd_format = [
-            'ffprobe',
-            '-v', 'error',
-            '-show_entries', 'format=format_name,bit_rate',
-            '-of', 'json',
-            str(filepath)
-        ]
-
-        result_format = subprocess.run(cmd_format, capture_output=True, text=True, check=False)
-        if result_format.returncode != 0:
-            return False, duration, "Cannot read format information"
-
-        return True, duration, None
-
-    except subprocess.CalledProcessError as e:
-        return False, 0, f"ffprobe error: {e.stderr}"
+        probe_result = subprocess.run(
+            probe_cmd, check=True, capture_output=True, text=True
+        )
+        duration = float(probe_result.stdout.strip())
+    except subprocess.CalledProcessError as exc:
+        stderr_output = cast(object, exc.stderr)
+        if isinstance(stderr_output, str):
+            detail = stderr_output.strip()
+        elif stderr_output is None:
+            detail = ""
+        else:
+            detail = str(stderr_output).strip()
+        return False, 0.0, f"ffprobe error: {detail}"
     except ValueError:
-        return False, 0, "Cannot parse duration"
-    except (OSError, IOError) as e:
-        return False, 0, f"Unexpected error: {str(e)}"
+        return False, 0.0, "Cannot parse duration"
+    except (OSError, IOError) as exc:
+        return False, 0.0, f"Unexpected error: {exc}"
+
+    if duration < 1.0:
+        return False, duration, "Duration too short (< 1 second)"
+
+    metadata_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=format_name,bit_rate",
+        "-of",
+        "json",
+        str(filepath),
+    ]
+
+    metadata_result = subprocess.run(
+        metadata_cmd, check=False, capture_output=True, text=True
+    )
+
+    if metadata_result.returncode != 0:
+        return False, duration, "Cannot read format information"
+
+    return True, duration, None
 
 
-def format_duration(seconds):
-    """Convert seconds to human-readable format."""
+def format_duration(seconds: float) -> str:
+    """Return a human readable version of ``seconds``."""
+
+    if seconds <= 0:
+        return "0s"
+
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
 
-    if hours > 0:
+    if hours:
         return f"{hours}h {minutes}m {secs}s"
-    elif minutes > 0:
+    if minutes:
         return f"{minutes}m {secs}s"
-    else:
-        return f"{secs}s"
+    return f"{secs}s"
 
 
-def check_file_worker(filepath_with_index, expected_durations):
-    """
-    Worker function to check a single file. 
-    Returns (index, filepath, status, actual_duration, expected_duration, error)
-    where status is one of: 'valid', 'corrupted', 'truncated', 'suspicious'
-    """
-    i, filepath = filepath_with_index
-    video_id = os.path.splitext(os.path.basename(filepath))[0]
+def _status_symbol(status: Status) -> str:
+    return {
+        "valid": "✓",
+        "corrupted": "✗",
+        "truncated": "⚠",
+        "suspicious": "⚠",
+    }.get(status, "?")
 
-    # Check the file
-    is_valid, actual_duration, error = check_opus_file(filepath)
+
+def check_file_worker(
+    task: tuple[int, Path], expected_durations: dict[str, int]
+) -> FileCheckResult:
+    """Inspect ``task`` and return a structured result."""
+
+    index, filepath = task
+    video_id = filepath.stem
+
+    is_valid, actual_duration, error_detail = check_opus_file(filepath)
     expected_duration = expected_durations.get(video_id)
 
     if not is_valid:
-        return (i, filepath, 'corrupted', actual_duration, expected_duration, error)
-    else:
-        # Check duration mismatch if we have expected duration
-        if expected_duration:
-            duration_diff = abs(actual_duration - expected_duration)
+        return FileCheckResult(
+            index=index,
+            path=filepath,
+            status="corrupted",
+            actual_duration=actual_duration,
+            expected_duration=expected_duration,
+            detail=error_detail,
+        )
 
-            if duration_diff > 1.0:  # More than 1 second difference
-                return (i, filepath, 'truncated', actual_duration, expected_duration, duration_diff)
-            else:
-                return (i, filepath, 'valid', actual_duration, expected_duration, None)
-        elif actual_duration < 60:  # Less than 1 minute is suspicious if no expected duration
-            return (i, filepath, 'suspicious', actual_duration, expected_duration, None)
+    if expected_duration is not None:
+        diff = abs(actual_duration - expected_duration)
+        if diff > 1.0:
+            return FileCheckResult(
+                index=index,
+                path=filepath,
+                status="truncated",
+                actual_duration=actual_duration,
+                expected_duration=expected_duration,
+                detail=diff,
+            )
+        return FileCheckResult(
+            index=index,
+            path=filepath,
+            status="valid",
+            actual_duration=actual_duration,
+            expected_duration=expected_duration,
+            detail=None,
+        )
+
+    if actual_duration < 60.0:
+        return FileCheckResult(
+            index=index,
+            path=filepath,
+            status="suspicious",
+            actual_duration=actual_duration,
+            expected_duration=None,
+            detail=None,
+        )
+
+    return FileCheckResult(
+        index=index,
+        path=filepath,
+        status="valid",
+        actual_duration=actual_duration,
+        expected_duration=None,
+        detail=None,
+    )
+
+
+def _gather_opus_files(directory: Path) -> list[Path]:
+    """Return every ``.opus`` file under ``directory``."""
+
+    return sorted(path for path in directory.rglob("*.opus") if path.is_file())
+
+
+def _gather_m4a_files(directory: Path) -> list[Path]:
+    return sorted(path for path in directory.rglob("*.m4a") if path.is_file())
+
+
+def _summarise_results(
+    results: list[FileCheckResult],
+) -> tuple[
+    list[tuple[Path, str]],
+    list[tuple[Path, float, float, float]],
+    list[tuple[Path, float]],
+    int,
+    float,
+]:
+    corrupted: list[tuple[Path, str]] = []
+    truncated: list[tuple[Path, float, float, float]] = []
+    suspicious: list[tuple[Path, float]] = []
+    valid_count = 0
+    total_duration = 0.0
+
+    for result in results:
+        if result.status == "corrupted":
+            corrupted.append((result.path, str(result.detail)))
+        elif result.status == "truncated":
+            truncated.append(
+                (
+                    result.path,
+                    result.actual_duration,
+                    result.expected_duration or 0.0,
+                    float(result.detail or 0.0),
+                )
+            )
+        elif result.status == "suspicious":
+            suspicious.append((result.path, result.actual_duration))
         else:
-            return (i, filepath, 'valid', actual_duration, expected_duration, None)
+            valid_count += 1
+            total_duration += result.actual_duration
+
+    return corrupted, truncated, suspicious, valid_count, total_duration
 
 
 def check_download_directory(
-    download_dir=DOWNLOAD_DIR,
-    csv_file=CSV_FILE,
-    summary_only=False,
-    processes=8,
-):
+    download_dir: Path = DOWNLOAD_DIR,
+    csv_file: Path | str = CSV_FILE,
+    *,
+    summary_only: bool = False,
+    processes: int = 8,
+) -> tuple[list[Path], set[str]]:
     """
-    Check all opus files in the download directory and its subdirectories.
-    Compare with expected durations from CSV file.
+    Inspect all downloaded Opus files and report issues.
+
+    Returns:
+        ``(problematic_paths, problematic_video_ids)``
     """
-    if not os.path.exists(download_dir):
+
+    if not download_dir.exists():
         print(f"Error: Directory '{download_dir}' not found.")
-        return
+        return [], set()
 
     print(f"Loading expected durations from '{csv_file}'...")
     expected_durations = load_expected_durations(csv_file)
@@ -196,100 +350,87 @@ def check_download_directory(
 
     print(f"Checking audio files in '{download_dir}'...\n")
 
-    # Find all opus files
-    opus_files = []
-    for root, _, files in os.walk(download_dir):
-        for file in files:
-            if file.endswith('.opus'):
-                opus_files.append(os.path.join(root, file))
-
+    opus_files = _gather_opus_files(download_dir)
     if not opus_files:
         print("No opus files found.")
-        return
+        return [], set()
 
     proc_label = "process" if processes == 1 else "processes"
-    print(
-        f"Found {len(opus_files)} opus files. Checking integrity using {processes} parallel {proc_label}...\n"
+    status_message = (
+        f"Found {len(opus_files)} opus files. Checking integrity using "
+        + f"{processes} parallel {proc_label}...\n"
     )
+    print(status_message)
 
-    # Prepare files with indices for parallel processing
-    files_with_indices = list(enumerate(opus_files, 1))
-
-    # Create partial function with expected_durations
+    files_with_indices = list(enumerate(opus_files, start=1))
     check_func = partial(check_file_worker, expected_durations=expected_durations)
 
-    # Process files in parallel
-    corrupted_files = []
-    suspicious_files = []
-    truncated_files = []
-    valid_files = 0
-    total_duration = 0
-    results = []
+    results: list[FileCheckResult] = []
 
     print("Processing files...")
-
     with Pool(processes=processes) as pool:
-        if TQDM_AVAILABLE:
-            # Use tqdm progress bar
-            with tqdm(total=len(files_with_indices), desc="Checking files", unit="file",
-                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
-                for result in pool.imap_unordered(check_func, files_with_indices):
+        iterator = pool.imap_unordered(check_func, files_with_indices)
+        if tqdm is not None:
+            with tqdm(
+                total=len(files_with_indices),
+                desc="Checking files",
+                unit="file",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            ) as progress:
+                for result in iterator:
                     results.append(result)
-                    # Update progress bar with current file info
-                    _, filepath, status, _, _, _ = result
-                    video_id = os.path.splitext(os.path.basename(filepath))[0]
-                    status_emoji = {"valid": "✓", "corrupted": "❌", "truncated": "⚠️", "suspicious": "⚠️"}.get(status, "?")
-                    pbar.set_postfix_str(f"{status_emoji} {video_id[:30]}", refresh=False)
-                    pbar.update(1)
+                    progress.set_postfix_str(
+                        f"{_status_symbol(result.status)} {result.path.stem[:30]}",
+                        refresh=False,
+                    )
+                    _ = progress.update(1)
         else:
-            # Fallback without progress bar
-            print("(Install 'tqdm' for progress bar: pip install tqdm)")
-            for i, result in enumerate(pool.imap_unordered(check_func, files_with_indices), 1):
+            for count, result in enumerate(iterator, start=1):
                 results.append(result)
-                if i % 100 == 0:  # Print progress every 100 files
-                    print(f"  Processed {i}/{len(files_with_indices)} files...")
+                if count % 100 == 0:
+                    print(f"  Processed {count}/{len(files_with_indices)} files...")
 
-    # Sort results by index to maintain order
-    results.sort(key=lambda x: x[0])
+    results.sort(key=lambda item: item.index)
 
-    # Quick summary after progress bar
-    problem_count = sum(1 for r in results if r[2] != 'valid')
-    if TQDM_AVAILABLE:
+    problem_count = sum(1 for item in results if item.status != "valid")
+    if tqdm is not None:
         print(f"\n✓ Checked {len(results)} files. Found {problem_count} problematic files.")
 
-    # Process results
     show_details = not summary_only
-    detail_lines = []
+    detail_lines: list[str] = []
 
-    for i, filepath, status, actual_duration, expected_duration, extra_info in results:
-        video_id = os.path.splitext(os.path.basename(filepath))[0]
+    corrupted, truncated, suspicious, valid_count, total_duration = _summarise_results(
+        results
+    )
 
-        if status == 'corrupted':
-            corrupted_files.append((filepath, extra_info))
-            if show_details:
-                detail_lines.append(f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ❌ CORRUPTED - {extra_info}")
-        elif status == 'truncated':
-            truncated_files.append((filepath, actual_duration, expected_duration, extra_info))
-            if show_details:
-                diff_seconds = extra_info
-                diff_percent = ((diff_seconds / expected_duration) * 100
-                                if expected_duration else None)
+    if show_details:
+        for result in results:
+            if result.status == "valid":
+                continue
+
+            stem = result.path.stem
+            prefix = f"[{result.index:4d}/{len(opus_files)}] {stem:.<50}"
+
+            if result.status == "corrupted":
+                detail_lines.append(
+                    f"{prefix} ✗ CORRUPTED - {result.detail or 'unknown error'}"
+                )
+            elif result.status == "truncated":
+                diff_seconds = float(result.detail or 0.0)
+                expected = result.expected_duration or 0.0
+                diff_percent = (diff_seconds / expected) * 100 if expected else None
                 diff_text = f"{diff_seconds:.1f}s off"
                 if diff_percent is not None:
                     diff_text += f", {diff_percent:.1f}% off"
-                detail_lines.append(
-                    f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ⚠️  TRUNCATED - Expected {format_duration(expected_duration)}, "
-                    f"got {format_duration(actual_duration)} ({diff_text})"
+                truncated_line = (
+                    f"{prefix} ⚠  TRUNCATED - Expected {format_duration(expected)}, "
+                    + f"got {format_duration(result.actual_duration)} ({diff_text})"
                 )
-        elif status == 'suspicious':
-            suspicious_files.append((filepath, actual_duration))
-            if show_details:
+                detail_lines.append(truncated_line)
+            else:  # suspicious
                 detail_lines.append(
-                    f"[{i:4d}/{len(opus_files)}] {video_id:.<50} ⚠️  SUSPICIOUS - Very short ({format_duration(actual_duration)})"
+                    f"{prefix} ⚠  SUSPICIOUS - Very short ({format_duration(result.actual_duration)})"
                 )
-        else:  # valid
-            valid_files += 1
-            total_duration += actual_duration
 
     if show_details and detail_lines:
         print("\nDetailed Results:")
@@ -297,269 +438,256 @@ def check_download_directory(
         for line in detail_lines:
             print(line)
 
-    # Summary
     print("\n" + "=" * 60)
     print("SUMMARY:")
     print(f"Total files checked: {len(opus_files)}")
-    print(f"Valid files: {valid_files}")
-    print(f"Corrupted files: {len(corrupted_files)}")
-    print(f"Truncated files (duration mismatch): {len(truncated_files)}")
-    print(f"Suspicious files (very short): {len(suspicious_files)}")
+    print(f"Valid files: {valid_count}")
+    print(f"Corrupted files: {len(corrupted)}")
+    print(f"Truncated files (duration mismatch): {len(truncated)}")
+    print(f"Suspicious files (very short): {len(suspicious)}")
 
-    if valid_files > 0:
+    if valid_count:
         print(f"Total duration of valid files: {format_duration(total_duration)}")
-        print(f"Average duration: {format_duration(total_duration / valid_files)}")
+        print(f"Average duration: {format_duration(total_duration / valid_count)}")
 
-    if corrupted_files:
-        print("\n❌ CORRUPTED FILES:")
-        for filepath, error in corrupted_files:
-            print(f"  - {filepath}")
+    if corrupted:
+        print("\n✗ CORRUPTED FILES:")
+        for path, error in corrupted:
+            print(f"  - {path}")
             print(f"    Error: {error}")
 
-    if truncated_files:
-        print("\n⚠️  TRUNCATED FILES (significant duration mismatch - likely interrupted):")
-        for filepath, actual, expected, diff_seconds in truncated_files:
-            print(f"  - {filepath}")
-            diff_percent = ((diff_seconds / expected) * 100 if expected else None)
+    if truncated:
+        print("\n⚠  TRUNCATED FILES (significant duration mismatch - likely interrupted):")
+        for path, actual, expected, diff_seconds in truncated:
+            diff_percent = (diff_seconds / expected) * 100 if expected else None
             diff_text = f"{diff_seconds:.1f}s off"
             if diff_percent is not None:
                 diff_text += f", {diff_percent:.1f}% off"
-            print(
-                f"    Expected: {format_duration(expected)}, Got: {format_duration(actual)} "
-                f"({diff_text})"
+            truncated_message = (
+                f"  - {path}\n"
+                + f"    Expected: {format_duration(expected)}, "
+                + f"got {format_duration(actual)} ({diff_text})"
             )
+            print(truncated_message)
 
-    if suspicious_files:
-        print("\n⚠️  SUSPICIOUS FILES (very short, no expected duration):")
-        for filepath, duration in suspicious_files:
-            print(f"  - {filepath} (duration: {format_duration(duration)})")
+    if suspicious:
+        print("\n⚠  SUSPICIOUS FILES (very short, no expected duration):")
+        for path, duration in suspicious:
+            print(f"  - {path} (duration: {format_duration(duration)})")
 
-    # Check for orphaned m4a files (might indicate failed conversions)
     print("\n" + "=" * 60)
     print("Checking for unconverted m4a files...")
-    m4a_files = []
-    for root, _, files in os.walk(download_dir):
-        for file in files:
-            if file.endswith('.m4a'):
-                m4a_files.append(os.path.join(root, file))
-
+    m4a_files = _gather_m4a_files(download_dir)
     if m4a_files:
-        print(f"\n⚠️  Found {len(m4a_files)} unconverted m4a files:")
-        for filepath in m4a_files:
-            print(f"  - {filepath}")
+        print(f"\n⚠  Found {len(m4a_files)} unconverted m4a files:")
+        for path in m4a_files:
+            print(f"  - {path}")
         print("These files may indicate interrupted conversions.")
 
-    # Print all problematic file paths for easy processing
-    all_problematic = []
+    corrupted_paths = [path for path, _ in corrupted]
+    truncated_paths = [path for path, _, _, _ in truncated]
+    suspicious_paths = [path for path, _ in suspicious]
 
-    # Collect all problematic opus files
-    for filepath, _ in corrupted_files:
-        all_problematic.append(filepath)
+    all_problematic = corrupted_paths + truncated_paths + suspicious_paths
+    video_ids = {path.stem for path in all_problematic}
 
-    for filepath, _, _, _ in truncated_files:
-        all_problematic.append(filepath)
+    if all_problematic and show_details:
+        print("\n" + "=" * 60)
+        print("ALL PROBLEMATIC OPUS FILES (for easy copying/processing):")
+        print("-" * 60)
+        for path in sorted(all_problematic):
+            print(path)
+        print("-" * 60)
+        print(f"Total problematic files: {len(all_problematic)}")
 
-    for filepath, _ in suspicious_files:
-        all_problematic.append(filepath)
-
-    if all_problematic:
-        if not summary_only:
-            print("\n" + "=" * 60)
-            print("ALL PROBLEMATIC OPUS FILES (for easy copying/processing):")
-            print("-" * 60)
-            for filepath in sorted(all_problematic):
-                print(filepath)
-            print("-" * 60)
-            print(f"Total problematic files: {len(all_problematic)}")
-
-        # Always print video IDs for easy re-downloading
         print("\n" + "=" * 60)
         print("VIDEO IDs TO RE-DOWNLOAD:")
         print("-" * 60)
-        video_ids = set()
-        for filepath in all_problematic:
-            video_id = os.path.splitext(os.path.basename(filepath))[0]
-            video_ids.add(video_id)
         for video_id in sorted(video_ids):
             print(video_id)
         print("-" * 60)
         print(f"Total videos to re-download: {len(video_ids)}")
 
-        return all_problematic, video_ids
-
-    return [], set()
+    return all_problematic, video_ids
 
 
-def delete_problematic_files_and_update_csv(problematic_files, video_ids, csv_file):
-    """
-    Delete problematic files and update the CSV to mark them as not downloaded.
-    """
+def _delete_files(paths: Iterable[Path]) -> int:
+    count = 0
+    for path in paths:
+        try:
+            path.unlink()
+            print(f"✓ Deleted: {path}")
+            count += 1
+        except (OSError, IOError) as exc:
+            print(f"✗ Failed to delete {path}: {exc}")
+    return count
+
+
+def _downloaded_count(df: DataFrame) -> int:
+    if "downloaded" not in df.columns:
+        return 0
+
+    total = cast(object, df["downloaded"].sum())
+    if isinstance(total, (int, float, bool)):
+        return int(total)
+    return 0
+
+
+def _update_csv_flags(csv_path: Path | str, video_ids: set[str]) -> tuple[int, int]:
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        print(f"✗ Failed to update CSV: {csv_path} not found")
+        return 0, 0
+    except (pd.errors.EmptyDataError, OSError) as exc:
+        print(f"✗ Failed to update CSV: {exc}")
+        return 0, 0
+
+    updated = 0
+    original_count = _downloaded_count(df)
+
+    records = df.to_dict(orient="records")
+    indices = cast(list[Hashable], list(df.index))
+
+    for index_label, record in zip(indices, records):
+        if get_video_id(cast(object, record.get("url"))) in video_ids:
+            df.loc[index_label, "downloaded"] = False
+            updated += 1
+
+    df.to_csv(csv_path, index=False)
+    new_count = _downloaded_count(df)
+    return updated, int(original_count - new_count)
+
+
+def perform_cleanup(
+    problematic_files: list[Path],
+    video_ids: set[str],
+    csv_path: Path | str,
+    *,
+    require_confirmation: bool,
+) -> None:
+    if not problematic_files:
+        print("\n✓ No problematic files found. Nothing to clean up!")
+        return
+
     print("\n" + "=" * 60)
     print("CLEANUP OPERATION")
     print("=" * 60)
 
-    # Confirm with user
-    print("\nThis will:")
-    print(f"1. Delete {len(problematic_files)} problematic opus files")
-    print(f"2. Mark {len(video_ids)} videos as not downloaded in {csv_file}")
+    if require_confirmation:
+        print("\nThis will:")
+        print(f"1. Delete {len(problematic_files)} problematic opus files")
+        print(f"2. Mark {len(video_ids)} videos as not downloaded in {csv_path}")
 
-    response = input("\nDo you want to proceed? (yes/no): ").strip().lower()
-    if response not in ['yes', 'y']:
-        print("Operation cancelled.")
-        return
+        response = input("\nDo you want to proceed? (yes/no): ").strip().lower()
+        if response not in {"yes", "y"}:
+            print("Operation cancelled.")
+            return
+    else:
+        print("\nRunning in auto-yes mode; skipping confirmation prompt.")
 
-    # Delete files
-    deleted_count = 0
     print("\nDeleting files...")
-    for filepath in problematic_files:
-        try:
-            os.remove(filepath)
-            print(f"✓ Deleted: {filepath}")
-            deleted_count += 1
-        except (OSError, IOError) as e:
-            print(f"✗ Failed to delete {filepath}: {e}")
+    deleted = _delete_files(problematic_files)
+    print(f"\nDeleted {deleted}/{len(problematic_files)} files.")
 
-    print(f"\nDeleted {deleted_count}/{len(problematic_files)} files.")
-
-    # Update CSV
-    print(f"\nUpdating {csv_file}...")
-    try:
-        df = pd.read_csv(csv_file)
-        original_count = df['downloaded'].sum()
-
-        # Mark videos as not downloaded
-        updated_count = 0
-        for _, row in df.iterrows():
-            video_id = get_video_id(row['url'])
-            if video_id in video_ids:
-                df.loc[df['url'] == row['url'], 'downloaded'] = False
-                updated_count += 1
-
-        # Save the updated CSV
-        df.to_csv(csv_file, index=False)
-        new_count = df['downloaded'].sum()
-
+    print(f"\nUpdating {csv_path}...")
+    updated_rows, difference = _update_csv_flags(csv_path, video_ids)
+    if updated_rows:
         print("✓ Updated CSV successfully")
-        print(f"  - Marked {updated_count} videos as not downloaded")
-        print(f"  - Downloaded count: {original_count} → {new_count}")
+        print(f"  - Marked {updated_rows} videos as not downloaded")
+        print(f"  - Downloaded count delta: {-difference}")
+    else:
+        print("No CSV rows required changes.")
 
-    except (FileNotFoundError, pd.errors.EmptyDataError, KeyError, IOError) as e:
-        print(f"✗ Failed to update CSV: {e}")
 
-
-def main():
-    # Check if ffprobe is available
+def main() -> None:
     try:
-        subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
+        _ = subprocess.run(["ffprobe", "-version"], capture_output=True, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("Error: ffprobe not found. Please install ffmpeg.")
         print("On Ubuntu/Debian: sudo apt-get install ffmpeg")
         print("On macOS: brew install ffmpeg")
         sys.exit(1)
 
-    # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description='Check integrity of downloaded audio files and optionally clean up problematic files.'
+        description="Check integrity of downloaded audio files and optionally clean up problematic files."
     )
-    parser.add_argument(
-        'download_dir',
-        nargs='?',
-        default=DOWNLOAD_DIR,
-        help='Directory containing downloaded files (default: {DOWNLOAD_DIR})'
+    _ = parser.add_argument(
+        "download_dir",
+        nargs="?",
+        default=str(DOWNLOAD_DIR),
+        help="Directory containing downloaded files (default: download/)",
     )
-    parser.add_argument(
-        'csv_file',
-        nargs='?',
-        default=CSV_FILE,
-        help='CSV file with video metadata (default: {CSV_FILE})'
+    _ = parser.add_argument(
+        "csv_file",
+        nargs="?",
+        default=str(CSV_FILE),
+        help="CSV file with video metadata (default: legco.csv)",
     )
-    parser.add_argument(
-        '--cleanup',
-        action='store_true',
-        help='Delete problematic files and update CSV'
+    _ = parser.add_argument(
+        "--cleanup", action="store_true", help="Delete problematic files and update CSV"
     )
-    parser.add_argument(
-        '--auto-yes',
-        action='store_true',
-        help='Automatically answer yes to cleanup confirmation'
+    _ = parser.add_argument(
+        "--auto-yes",
+        action="store_true",
+        help="Automatically answer yes to cleanup confirmation",
     )
-    parser.add_argument(
-        '--summary-only',
-        action='store_true',
-        help='Show only summary without detailed file-by-file results'
+    _ = parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Show only summary without detailed file-by-file results",
     )
-    parser.add_argument(
-        '--processes',
+    _ = parser.add_argument(
+        "--processes",
         type=int,
         default=8,
-        help='Number of parallel processes to use (default: 8)'
+        help="Number of parallel processes to use (default: 8)",
     )
 
-    args = parser.parse_args()
+    args_namespace = parser.parse_args()
 
-    if args.processes < 1:
-        parser.error('--processes must be at least 1')
+    download_dir_raw = cast(str, args_namespace.download_dir)
+    csv_file_raw = cast(str, args_namespace.csv_file)
+    cleanup_flag = cast(bool, args_namespace.cleanup)
+    auto_yes_flag = cast(bool, args_namespace.auto_yes)
+    summary_only_flag = cast(bool, args_namespace.summary_only)
+    processes_value = cast(int, args_namespace.processes)
 
-    print(f"Using download directory: {args.download_dir}")
-    print(f"Using CSV file: {args.csv_file}\n")
+    download_dir_value = Path(download_dir_raw)
+    csv_file_value = Path(csv_file_raw)
 
-    # Run the integrity check
+    cli_args = CliArgs(
+        download_dir=download_dir_value,
+        csv_file=csv_file_value,
+        cleanup=cleanup_flag,
+        auto_yes=auto_yes_flag,
+        summary_only=summary_only_flag,
+        processes=processes_value,
+    )
+
+    if cli_args.processes < 1:
+        parser.error("--processes must be at least 1")
+
+    download_dir = cli_args.download_dir
+    csv_path = cli_args.csv_file
+
+    print(f"Using download directory: {download_dir}")
+    print(f"Using CSV file: {csv_path}\n")
+
     problematic_files, video_ids = check_download_directory(
-        download_dir=args.download_dir,
-        csv_file=args.csv_file,
-        summary_only=args.summary_only,
-        processes=args.processes,
+        download_dir=download_dir,
+        csv_file=csv_path,
+        summary_only=cli_args.summary_only,
+        processes=cli_args.processes,
     )
 
-    # If cleanup is requested and there are problematic files
-    if args.cleanup and problematic_files:
-        if args.auto_yes:
-            # Skip confirmation prompt
-            print("\n" + "=" * 60)
-            print("CLEANUP OPERATION (auto-yes mode)")
-            print("=" * 60)
-
-            # Delete files
-            deleted_count = 0
-            print("\nDeleting files...")
-            for filepath in problematic_files:
-                try:
-                    os.remove(filepath)
-                    print(f"✓ Deleted: {filepath}")
-                    deleted_count += 1
-                except (OSError, IOError) as e:
-                    print(f"✗ Failed to delete {filepath}: {e}")
-
-            print(f"\nDeleted {deleted_count}/{len(problematic_files)} files.")
-
-            # Update CSV
-            print(f"\nUpdating {args.csv_file}...")
-            try:
-                df = pd.read_csv(args.csv_file)
-                original_count = df['downloaded'].sum()
-
-                # Mark videos as not downloaded
-                updated_count = 0
-                for _, row in df.iterrows():
-                    video_id = get_video_id(row['url'])
-                    if video_id in video_ids:
-                        df.loc[df['url'] == row['url'], 'downloaded'] = False
-                        updated_count += 1
-
-                # Save the updated CSV
-                df.to_csv(args.csv_file, index=False)
-                new_count = df['downloaded'].sum()
-
-                print("✓ Updated CSV successfully")
-                print(f"  - Marked {updated_count} videos as not downloaded")
-                print(f"  - Downloaded count: {original_count} → {new_count}")
-
-            except (FileNotFoundError, pd.errors.EmptyDataError, KeyError, IOError) as e:
-                print(f"✗ Failed to update CSV: {e}")
-        else:
-            delete_problematic_files_and_update_csv(problematic_files, video_ids, args.csv_file)
-    elif args.cleanup and not problematic_files:
-        print("\n✓ No problematic files found. Nothing to clean up!")
+    if cli_args.cleanup:
+        perform_cleanup(
+            problematic_files,
+            video_ids,
+            csv_path,
+            require_confirmation=not cli_args.auto_yes,
+        )
 
 
 if __name__ == "__main__":

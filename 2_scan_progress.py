@@ -1,91 +1,136 @@
-import os
+from __future__ import annotations
+
+# pyright: reportMissingTypeStubs=false
+
+from collections.abc import Hashable
+from pathlib import Path
+from typing import cast
+from urllib.parse import parse_qs, urlparse
+
 import pandas as pd
-from urllib.parse import urlparse, parse_qs
+from pandas import DataFrame
+
 
 # --- CONFIGURATION ---
-CSV_FILE = 'legco.csv'
-DOWNLOAD_DIR = 'download/'
+CSV_FILE = Path("legco.csv")
+DOWNLOAD_DIR = Path("download")
 # --- END CONFIGURATION ---
 
-def get_video_id(url):
-    """
-    Extracts the YouTube video ID from a URL.
-    Handles standard youtube.com and youtu.be links.
-    """
-    if pd.isna(url):
+
+def get_video_id(url: object) -> str | None:
+    """Extract the YouTube video ID from ``url``."""
+
+    if not isinstance(url, str):
         return None
-    try:
-        if 'youtu.be' in url:
-            return url.split('/')[-1].split('?')[0]
-        parsed_url = urlparse(url)
-        if parsed_url.hostname in ['www.youtube.com', 'youtube.com']:
-            video_id = parse_qs(parsed_url.query).get('v')
-            if video_id:
-                return video_id[0]
-    except Exception as e:
-        print(f"Could not parse URL '{url}': {e}")
-    return None
 
-def scan_and_update_progress():
-    """
-    Scans the download directory and updates the CSV file to reflect
-    the actual download progress.
-    """
-    print(f"Scanning for downloaded files in '{DOWNLOAD_DIR}'...")
+    if "youtu.be" in url:
+        parts = url.rstrip("/").split("/")
+        if parts:
+            candidate = parts[-1].split("?")[0]
+            return candidate or None
+        return None
 
-    if not os.path.isdir(DOWNLOAD_DIR):
-        print(f"Error: Download directory '{DOWNLOAD_DIR}' not found.")
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"www.youtube.com", "youtube.com"}:
+        return None
+
+    candidates = parse_qs(parsed.query).get("v")
+    if not candidates:
+        return None
+
+    return candidates[0] or None
+
+
+def _load_downloaded_ids(download_dir: Path) -> set[str]:
+    """Return the set of video IDs inferred from ``download_dir``."""
+
+    downloaded_ids: set[str] = set()
+    for path in download_dir.rglob("*.opus"):
+        if path.is_file():
+            downloaded_ids.add(path.stem)
+    return downloaded_ids
+
+
+def _is_marked_downloaded(value: object) -> bool:
+    """Interpret the ``downloaded`` column values as booleans."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return False
+
+
+def _ensure_download_column(df: DataFrame) -> None:
+    if "downloaded" not in df.columns:
+        df["downloaded"] = False
+
+
+def scan_and_update_progress(
+    download_dir: Path = DOWNLOAD_DIR, csv_path: Path = CSV_FILE
+) -> None:
+    """
+    Scan the download directory and update the metadata CSV to match reality.
+    """
+
+    print(f"Scanning for downloaded files in '{download_dir}'...")
+
+    if not download_dir.is_dir():
+        print(f"Error: Download directory '{download_dir}' not found.")
         return
 
-    # 1. Get a set of video IDs from the filenames in the download directory
-    try:
-        downloaded_ids = set()
-        for root, _, files in os.walk(DOWNLOAD_DIR):
-            for file in files:
-                if file.endswith('.opus'):
-                    downloaded_ids.add(os.path.splitext(file)[0])
-        print(f"Found {len(downloaded_ids)} downloaded audio files across all subdirectories.")
-    except Exception as e:
-        print(f"Error reading directory '{DOWNLOAD_DIR}': {e}")
-        return
+    downloaded_ids = _load_downloaded_ids(download_dir)
+    print(
+        f"Found {len(downloaded_ids)} downloaded audio files across all subdirectories."
+    )
 
-    # 2. Read the CSV file
     try:
-        df = pd.read_csv(CSV_FILE)
+        df = pd.read_csv(csv_path)
     except FileNotFoundError:
-        print(f"Error: CSV file '{CSV_FILE}' not found.")
+        print(f"Error: CSV file '{csv_path}' not found.")
         return
-    except Exception as e:
-        print(f"Error reading CSV file '{CSV_FILE}': {e}")
+    except (pd.errors.EmptyDataError, OSError) as exc:
+        print(f"Error reading CSV file '{csv_path}': {exc}")
         return
 
-    # 3. Iterate and update status, and count missing files
+    _ensure_download_column(df)
+
     updates_made = 0
     missing_files_count = 0
-    for index, row in df.iterrows():
-        video_id = get_video_id(row['url'])
-        is_downloaded = row['downloaded']
 
-        if is_downloaded:
-            if video_id not in downloaded_ids:
-                missing_files_count += 1
-        elif video_id and video_id in downloaded_ids:
-            df.loc[index, 'downloaded'] = True
+    records = df.to_dict(orient="records")
+    indices = cast(list[Hashable], list(df.index))
+
+    for index_label, record in zip(indices, records):
+        video_id = get_video_id(cast(object, record.get("url")))
+        is_marked = _is_marked_downloaded(cast(object, record.get("downloaded")))
+
+        if is_marked and (video_id not in downloaded_ids):
+            missing_files_count += 1
+        elif not is_marked and video_id and (video_id in downloaded_ids):
+            df.loc[index_label, "downloaded"] = True
             updates_made += 1
 
-    # 4. Save the updated DataFrame back to the CSV
-    if updates_made > 0:
+    if updates_made:
         print(f"Updating {updates_made} rows in the CSV to 'downloaded: True'.")
         try:
-            df.to_csv(CSV_FILE, index=False)
-            print(f"Successfully updated '{CSV_FILE}'.")
-        except Exception as e:
-            print(f"Error saving updated CSV file: {e}")
+            df.to_csv(csv_path, index=False)
+            print(f"Successfully updated '{csv_path}'.")
+        except (OSError, IOError) as exc:
+            print(f"Error saving updated CSV file: {exc}")
     else:
         print("No updates needed. CSV file is already in sync with the download folder.")
 
-    if missing_files_count > 0:
-        print(f"Warning: Found {missing_files_count} files marked as 'True' in the CSV but not found in the download folder.")
+    if missing_files_count:
+        warning_message = (
+            f"Warning: Found {missing_files_count} files marked as 'True' in the CSV "
+            + "but not found in the download folder."
+        )
+        print(warning_message)
+
 
 if __name__ == "__main__":
     scan_and_update_progress()

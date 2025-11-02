@@ -1,105 +1,123 @@
-import os
-import pandas as pd
+from __future__ import annotations
+
+# pyright: reportMissingTypeStubs=false
+
 import shutil
-from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import pandas as pd
+from pandas import DataFrame
+from typing import cast
+
 
 # --- CONFIGURATION ---
-CSV_FILE = 'legco.csv'
-DOWNLOAD_DIR = 'download/'
+CSV_FILE = Path("legco.csv")
+DOWNLOAD_DIR = Path("download")
 # --- END CONFIGURATION ---
 
-def get_video_id(url):
-    """
-    Extracts the YouTube video ID from a URL.
-    Handles standard youtube.com and youtu.be links.
-    """
-    if pd.isna(url):
+
+def get_video_id(url: object) -> str | None:
+    """Extract the YouTube video ID from ``url``."""
+
+    if not isinstance(url, str):
         return None
-    try:
-        if 'youtu.be' in url:
-            return url.split('/')[-1].split('?')[0]
-        parsed_url = urlparse(url)
-        if parsed_url.hostname in ['www.youtube.com', 'youtube.com']:
-            video_id = parse_qs(parsed_url.query).get('v')
-            if video_id:
-                return video_id[0]
-    except Exception as e:
-        print(f"Could not parse URL '{url}': {e}")
-    return None
 
-def organize_downloads_by_year():
+    if "youtu.be" in url:
+        parts = url.rstrip("/").split("/")
+        if parts:
+            candidate = parts[-1].split("?")[0]
+            return candidate or None
+        return None
+
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"www.youtube.com", "youtube.com"}:
+        return None
+
+    candidates = parse_qs(parsed.query).get("v")
+    if not candidates:
+        return None
+
+    return candidates[0] or None
+
+
+def _build_video_year_map(df: DataFrame) -> dict[str, str]:
+    """Return a mapping from video ID to publication year."""
+
+    mapping: dict[str, str] = {}
+    records = df.to_dict(orient="records")
+
+    for record in records:
+        video_id = get_video_id(cast(object, record.get("url")))
+        publish_date = record.get("publish_date")
+
+        if video_id and isinstance(publish_date, str) and len(publish_date) >= 4:
+            mapping[video_id] = publish_date.split("-")[0]
+
+    return mapping
+
+
+def organise_downloads_by_year(
+    csv_path: Path = CSV_FILE, download_dir: Path = DOWNLOAD_DIR
+) -> None:
     """
-    Organizes downloaded audio files into subdirectories based on their
-    upload year, sourced from the CSV file.
+    Move every downloaded ``.opus`` file into a year-based subdirectory.
     """
-    print(f"Reading video metadata from '{CSV_FILE}'...")
+
+    print(f"Reading video metadata from '{csv_path}'...")
     try:
-        df = pd.read_csv(CSV_FILE)
+        df = pd.read_csv(csv_path)
     except FileNotFoundError:
-        print(f"Error: CSV file '{CSV_FILE}' not found.")
+        print(f"Error: CSV file '{csv_path}' not found.")
         return
-    except Exception as e:
-        print(f"Error reading CSV file: {e}")
+    except (pd.errors.EmptyDataError, OSError) as exc:
+        print(f"Error reading CSV file: {exc}")
         return
 
-    # 1. Create a mapping from video_id to its upload year
-    video_id_to_year = {}
-    for _, row in df.iterrows():
-        video_id = get_video_id(row['url'])
-        if video_id and pd.notna(row['publish_date']):
-            # Extract year from 'YYYY-MM-DD' format
-            year = str(row['publish_date']).split('-')[0]
-            video_id_to_year[video_id] = year
-    
+    video_id_to_year = _build_video_year_map(df)
     print(f"Created a map for {len(video_id_to_year)} videos.")
 
-    # 2. Get list of .opus files in the download directory
-    if not os.path.isdir(DOWNLOAD_DIR):
-        print(f"Error: Download directory '{DOWNLOAD_DIR}' not found.")
-        return
-        
-    try:
-        files_to_organize = [
-            f for f in os.listdir(DOWNLOAD_DIR)
-            if f.endswith('.opus') and os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
-        ]
-        if not files_to_organize:
-            print("No .opus files found in the download directory to organize.")
-            return
-    except Exception as e:
-        print(f"Error listing files in '{DOWNLOAD_DIR}': {e}")
+    if not download_dir.is_dir():
+        print(f"Error: Download directory '{download_dir}' not found.")
         return
 
-    # 3. Move files to their respective year folders
+    files_to_organise = [
+        path for path in download_dir.iterdir() if path.suffix == ".opus" and path.is_file()
+    ]
+
+    if not files_to_organise:
+        print("No .opus files found in the download directory to organise.")
+        return
+
     moved_count = 0
     unmapped_count = 0
-    print(f"Starting to organize {len(files_to_organize)} files...")
+    print(f"Starting to organise {len(files_to_organise)} files...")
 
-    for filename in files_to_organize:
-        video_id = os.path.splitext(filename)[0]
+    for source_path in files_to_organise:
+        video_id = source_path.stem
         year = video_id_to_year.get(video_id)
 
-        if year:
-            source_path = os.path.join(DOWNLOAD_DIR, filename)
-            year_dir = os.path.join(DOWNLOAD_DIR, year)
-            destination_path = os.path.join(year_dir, filename)
-
-            # Create the year-specific subdirectory if it doesn't exist
-            os.makedirs(year_dir, exist_ok=True)
-
-            try:
-                shutil.move(source_path, destination_path)
-                moved_count += 1
-            except Exception as e:
-                print(f"Error moving '{filename}': {e}")
-        else:
+        if not year:
             print(f"Warning: No upload year found for video ID '{video_id}'. Skipping.")
             unmapped_count += 1
-    
-    print("\n--- Organization Complete ---")
+            continue
+
+        year_dir = download_dir / year
+        destination = year_dir / source_path.name
+
+        try:
+            year_dir.mkdir(parents=True, exist_ok=True)
+            _ = shutil.move(str(source_path), str(destination))
+            moved_count += 1
+        except (OSError, shutil.Error) as exc:
+            print(f"Error moving '{source_path.name}': {exc}")
+
+    print("\n--- Organisation Complete ---")
     print(f"Successfully moved {moved_count} files.")
-    if unmapped_count > 0:
+    if unmapped_count:
         print(f"{unmapped_count} files were skipped as they could not be mapped to a year.")
 
+
 if __name__ == "__main__":
-    organize_downloads_by_year()
+    organise_downloads_by_year()
