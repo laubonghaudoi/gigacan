@@ -15,11 +15,35 @@ from yt_dlp import YoutubeDL
 
 # --- CONFIGURATION ---
 CSV_FILE = Path("legco.csv")
-SUBTITLE_DIR = Path("subtitle")
 COOKIES_FILE = Path("cookies.txt")
-TARGET_LANG_PRIORITY = ["yue-Hant", "yue"]
 SUBTITLE_EXTENSIONS = {".srt", ".vtt", ".ass", ".ttml", ".lrc", ".json3"}
 # --- END CONFIGURATION ---
+
+
+@dataclass(frozen=True, slots=True)
+class SubtitleTarget:
+    """One subtitle tracking target in the CSV."""
+
+    column: str
+    language_priority: tuple[str, ...]
+    label: str
+    output_root: Path
+
+
+TARGETS: tuple[SubtitleTarget, ...] = (
+    SubtitleTarget(
+        column="subtitle_downloaded",
+        language_priority=("yue-Hant", "yue"),
+        label="yue-Hant/yue",
+        output_root=Path("yue"),
+    ),
+    SubtitleTarget(
+        column="zh-hk_downloaded",
+        language_priority=("zh-HK",),
+        label="zh-HK",
+        output_root=Path("zh-hk"),
+    ),
+)
 
 
 @dataclass(slots=True)
@@ -97,11 +121,12 @@ def _is_marked_downloaded(value: object) -> bool:
     return False
 
 
-def _ensure_subtitle_downloaded_column(df: DataFrame) -> None:
-    if "subtitle_downloaded" not in df.columns:
-        df["subtitle_downloaded"] = False
-    else:
-        df["subtitle_downloaded"] = df["subtitle_downloaded"].map(_is_marked_downloaded)
+def _ensure_target_columns(df: DataFrame) -> None:
+    for target in TARGETS:
+        if target.column not in df.columns:
+            df[target.column] = False
+        else:
+            df[target.column] = df[target.column].map(_is_marked_downloaded)
 
 
 def _normalise_publish_date(df: DataFrame) -> None:
@@ -157,28 +182,32 @@ def _normalise_subtitles(raw: object) -> dict[str, list[dict[str, Any]]]:
     return subtitles
 
 
+def _lang_matches_target(candidate: str, target: str) -> bool:
+    candidate_norm = _normalise_lang(candidate)
+    target_norm = _normalise_lang(target)
+    return candidate_norm == target_norm or candidate_norm.startswith(target_norm + "-")
+
+
+def _lang_matches_any_target(candidate: str, targets: tuple[str, ...]) -> bool:
+    return any(_lang_matches_target(candidate, target) for target in targets)
+
+
 def _choose_matching_lang(candidates: list[str], target: str) -> str | None:
     if not candidates:
         return None
 
-    target_norm = _normalise_lang(target)
-    exact = [lang for lang in candidates if _normalise_lang(lang) == target_norm]
+    exact = [lang for lang in candidates if _lang_matches_target(lang, target)]
     if exact:
         return sorted(exact)[0]
-
-    prefixed = [
-        lang
-        for lang in candidates
-        if _normalise_lang(lang).startswith(target_norm + "-")
-    ]
-    if prefixed:
-        return sorted(prefixed)[0]
 
     return None
 
 
-def select_subtitle_track(info: dict[str, Any]) -> SubtitleSelection | None:
-    """Pick yue-Hant first, then yue; manual preferred over auto for same language."""
+def select_subtitle_track(
+    info: dict[str, Any],
+    language_priority: tuple[str, ...],
+) -> SubtitleSelection | None:
+    """Select manual first, then auto, according to ``language_priority``."""
 
     manual = _normalise_subtitles(info.get("subtitles"))
     auto = _normalise_subtitles(info.get("automatic_captions"))
@@ -186,7 +215,7 @@ def select_subtitle_track(info: dict[str, Any]) -> SubtitleSelection | None:
     manual_keys = [key for key in manual if _normalise_lang(key) != "live-chat"]
     auto_keys = [key for key in auto if _normalise_lang(key) != "live-chat"]
 
-    for target in TARGET_LANG_PRIORITY:
+    for target in language_priority:
         manual_lang = _choose_matching_lang(manual_keys, target)
         if manual_lang:
             return SubtitleSelection(source="manual", language=manual_lang)
@@ -198,8 +227,8 @@ def select_subtitle_track(info: dict[str, Any]) -> SubtitleSelection | None:
     return None
 
 
-def _subtitle_dir_for_year(year: str) -> Path:
-    return SUBTITLE_DIR / year
+def _subtitle_dir_for_year(target: SubtitleTarget, year: str) -> Path:
+    return target.output_root / year
 
 
 def _subtitle_suffix_priority(path: Path) -> tuple[int, str]:
@@ -218,8 +247,12 @@ def _extract_lang_from_filename(path: Path, video_id: str) -> str:
     return stem_part.rsplit(".", 1)[0]
 
 
-def find_existing_target_subtitle(video_id: str, year: str) -> Path | None:
-    year_dir = _subtitle_dir_for_year(year)
+def find_existing_target_subtitle(
+    video_id: str,
+    year: str,
+    target: SubtitleTarget,
+) -> Path | None:
+    year_dir = _subtitle_dir_for_year(target, year)
     if not year_dir.is_dir():
         return None
 
@@ -230,8 +263,9 @@ def find_existing_target_subtitle(video_id: str, year: str) -> Path | None:
         if path.suffix.lower() not in SUBTITLE_EXTENSIONS:
             continue
         lang = _extract_lang_from_filename(path, video_id)
-        lang_norm = _normalise_lang(lang)
-        if lang_norm == "yue-hant" or lang_norm == "yue":
+        if not lang:
+            continue
+        if _lang_matches_any_target(lang, target.language_priority):
             candidates.append(path)
 
     if not candidates:
@@ -240,8 +274,12 @@ def find_existing_target_subtitle(video_id: str, year: str) -> Path | None:
     return sorted(candidates, key=_subtitle_suffix_priority)[0]
 
 
-def download_subtitle(task: SubtitleTask, selection: SubtitleSelection) -> Path | None:
-    year_dir = _subtitle_dir_for_year(task.year)
+def download_subtitle(
+    task: SubtitleTask,
+    target: SubtitleTarget,
+    selection: SubtitleSelection,
+) -> Path | None:
+    year_dir = _subtitle_dir_for_year(target, task.year)
     year_dir.mkdir(parents=True, exist_ok=True)
 
     options = _base_ydl_options()
@@ -274,8 +312,11 @@ def download_subtitle(task: SubtitleTask, selection: SubtitleSelection) -> Path 
     if exact_any:
         return exact_any[0]
 
-    fallback = find_existing_target_subtitle(task.video_id, task.year)
-    return fallback
+    return find_existing_target_subtitle(
+        task.video_id,
+        task.year,
+        target,
+    )
 
 
 def load_tasks(df: DataFrame) -> list[SubtitleTask]:
@@ -293,10 +334,15 @@ def load_tasks(df: DataFrame) -> list[SubtitleTask]:
             continue
 
         year = _normalise_year(record.get("publish_date"))
-        marked = _is_marked_downloaded(record.get("subtitle_downloaded"))
-        existing = find_existing_target_subtitle(video_id, year)
 
-        if marked and existing is not None:
+        done_for_all_targets = True
+        for target in TARGETS:
+            marked = _is_marked_downloaded(record.get(target.column))
+            if not marked:
+                done_for_all_targets = False
+                break
+
+        if done_for_all_targets:
             continue
 
         tasks.append(
@@ -312,51 +358,84 @@ def load_tasks(df: DataFrame) -> list[SubtitleTask]:
 
 
 def process_task(df: DataFrame, task: SubtitleTask) -> bool:
-    existing = find_existing_target_subtitle(task.video_id, task.year)
-    if existing is not None:
-        df.loc[task.index, "subtitle_downloaded"] = True
-        print(f"[skip] {task.video_id}: already has yue subtitle at {existing}")
+    row_had_error = False
+
+    marked_map: dict[str, bool] = {}
+    for target in TARGETS:
+        marked_map[target.column] = _is_marked_downloaded(df.loc[task.index, target.column])
+
+    pending_targets: list[SubtitleTarget] = []
+    for target in TARGETS:
+        if marked_map[target.column]:
+            print(
+                f"[skip] {task.video_id}: {target.label} marked downloaded in CSV ({target.column}=True)"
+            )
+            continue
+
+        existing = find_existing_target_subtitle(task.video_id, task.year, target)
+        if existing is not None:
+            df.loc[task.index, target.column] = True
+            print(
+                f"[skip] {task.video_id}: already has {target.label} subtitle at {existing}"
+            )
+            continue
+
+        pending_targets.append(target)
+
+    if not pending_targets:
         return True
 
     try:
         info = _extract_video_info(task.url)
     except Exception as exc:
         print(f"[error] {task.video_id}: failed to read metadata ({exc})")
-        df.loc[task.index, "subtitle_downloaded"] = False
+        for target in TARGETS:
+            if not marked_map[target.column]:
+                df.loc[task.index, target.column] = False
         return False
 
     if info is None:
         print(f"[skip] {task.video_id}: could not fetch metadata")
-        df.loc[task.index, "subtitle_downloaded"] = False
+        for target in TARGETS:
+            if not marked_map[target.column]:
+                df.loc[task.index, target.column] = False
         return False
 
-    selection = select_subtitle_track(info)
-    if selection is None:
-        print(f"[skip] {task.video_id}: no yue-Hant/yue subtitle available")
-        df.loc[task.index, "subtitle_downloaded"] = False
-        return True
+    for target in pending_targets:
+        selection = select_subtitle_track(info, target.language_priority)
+        if selection is None:
+            print(
+                f"[skip] {task.video_id}: no {target.label} subtitle available"
+            )
+            df.loc[task.index, target.column] = False
+            continue
 
-    try:
-        subtitle_path = download_subtitle(task, selection)
-    except Exception as exc:
-        print(f"[error] {task.video_id}: subtitle download failed ({exc})")
-        df.loc[task.index, "subtitle_downloaded"] = False
-        return False
+        try:
+            subtitle_path = download_subtitle(task, target, selection)
+        except Exception as exc:
+            print(
+                f"[error] {task.video_id}: {target.label} subtitle download failed ({exc})"
+            )
+            df.loc[task.index, target.column] = False
+            row_had_error = True
+            continue
 
-    if subtitle_path is None:
+        if subtitle_path is None:
+            print(
+                f"[skip] {task.video_id}: selected {target.label} "
+                + f"({selection.source}/{selection.language}) but no file was produced"
+            )
+            df.loc[task.index, target.column] = False
+            row_had_error = True
+            continue
+
+        df.loc[task.index, target.column] = True
         print(
-            f"[skip] {task.video_id}: selected {selection.source}/{selection.language} "
-            + "but no subtitle file was produced"
+            f"[ok] {task.video_id}: downloaded {target.label} "
+            + f"({selection.source}/{selection.language}) -> {subtitle_path}"
         )
-        df.loc[task.index, "subtitle_downloaded"] = False
-        return False
 
-    df.loc[task.index, "subtitle_downloaded"] = True
-    print(
-        f"[ok] {task.video_id}: downloaded {selection.source}/{selection.language} -> "
-        + f"{subtitle_path}"
-    )
-    return True
+    return not row_had_error
 
 
 def main() -> None:
@@ -366,7 +445,7 @@ def main() -> None:
         print(f"Error: {CSV_FILE} not found.")
         return
 
-    _ensure_subtitle_downloaded_column(df)
+    _ensure_target_columns(df)
     _normalise_publish_date(df)
 
     if not COOKIES_FILE.exists():
@@ -379,8 +458,6 @@ def main() -> None:
         print("No pending subtitle tasks.")
         df.to_csv(CSV_FILE, index=False)
         return
-
-    SUBTITLE_DIR.mkdir(parents=True, exist_ok=True)
 
     completed = 0
     for idx, task in enumerate(tasks, start=1):
