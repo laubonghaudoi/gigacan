@@ -10,7 +10,7 @@
 呢一步要反覆試錯，因為 yt-dlp 下載經常會中斷。而且需要好多儲存空間，所以要經常𥄫住然後人手重試。首先要確定目標頻道或者播放清單，然後針對
 
 1. 準備好 GCP 嘅 YouTube API key，開一個 `.env` 放個 `YOUTUBE_API_KEY=AIxxxxx` 然後跑 `uv run 1_get_video_list.py` 將指定頻道或者播放清單入面所有影片嘅 metadata 爬落一個 csv 文件度，呢個 csv 亦用於登記下載進度。
-1. `uv run 2_download_audio.py`，會按照上面嘅 csv 記錄嘅進度，將未下載嘅片下載落`download/`並轉化成 16kHz OPUS 格式。
+1. `uv run 2_download_audio.py`，會按照上面嘅 csv 記錄嘅進度，將未下載嘅片下載落`download/`並轉化成 16kHz OPUS 格式。最好放一個`cookies.txt`否則youtube會反爬蟲突然中斷下載。
     1. 因為下載過程會經常因為 YouTube 反爬蟲、空間唔夠等等意外中斷，所以需要有呢個 csv 嚟記錄進度。如果下載中斷，可以跑 `uv run 2_scan_progress.py`，會自動檢查 `download/` 入面邊啲已經下載咗邊啲未下載，然後更新個 csv 將啲已經下載且轉碼成功嘅登記為 `downloaded=True`。
     1. 每次中斷後重新跑 `2_download_audio.py` 都會自動讀取個 csv，按照 `downloaded`嗰列 `false` 嘅嚟下載。
     1. 下載完之後跑個 `2_organize_downloads.py` 會自動將 `download/` 入面下載好嘅音頻按照年份分類。

@@ -8,3 +8,8 @@ datasets
 google-api-python-client
 tqdm
 webdataset
+transformers==4.57.6
+torch
+torchaudio
+opencc
+funasr
