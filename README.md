@@ -32,7 +32,7 @@
 
 1. `uv run transcribe`（預設會遞迴掃描 `download/`，並將字幕輸出到 `transcriptions/<year>/*.srt`）
 1. 只跑某一年：`uv run transcribe --year 2025`
-1. 預設用 vLLM backend（`--vllm-gpu-memory-utilization` 預設 0.9）；如果冇 CUDA 可以改用：`uv run transcribe --backend transformers`
+1. 目前固定使用 transformers backend（CUDA 可用時會用 `cuda:0`，否則自動回落 CPU）
 1. 單檔模式：`uv run transcribe --audio download/2026/J-ajS2LNnfs.opus --output-srt ./no_prompt.srt`
 1. 針對影片類別修改 system  prompt，然後跑 `2_vtt.py`，會用 silero-vad 將輸入音頻分段再叫 qwen3-asr-flash 轉寫成粵文，生成 .vtt 字幕文件到 `vtt/`。
     1. 記得修改 `2_vtt.py` 入面嘅 prompt，會對字幕準確度有好大影響。
@@ -54,10 +54,9 @@
 1. **可恢復（resumable）機制**
    1. 預設 skip 已存在 `.srt`（除非 `--overwrite`），中斷後可直接續跑。
    1. `write_srt` 採用臨時文件 + `os.replace` 原子寫入，避免中斷時留下破損 SRT。
-1. **ASR 後端升級**
-   1. 後端支援 `vllm` / `transformers`（預設 `vllm`）。
-   1. vLLM 支援參數：`--vllm-gpu-memory-utilization`、`--vllm-max-num-seqs`、`--vllm-max-num-batched-tokens`、`--vllm-max-model-len`。
-   1. 若 vLLM prerequisites 唔滿足或者初始化失敗，會 fallback 去 transformers。
+1. **ASR 後端**
+   1. 目前固定使用 `transformers`。
+   1. `--qwen-dtype auto`：CUDA 會用 `bfloat16`，CPU 會用 `float32`。
 1. **Persistent Worker（常駐進程）**
    1. 支援 UNIX socket 常駐 worker，重用已載入模型，減少反覆冷啟動。
    1. 支援 `ping/shutdown` 同 runtime signature 檢查；配置改變會自動重啟 worker。

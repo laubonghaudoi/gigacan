@@ -40,24 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--qwen-context", default="")
     parser.add_argument("--use-prompt", action="store_true")
     parser.add_argument(
-        "--backend",
-        default="vllm",
-        choices=["vllm", "transformers"],
-    )
-    parser.add_argument(
         "--qwen-dtype",
         default="auto",
         choices=["auto", "float32", "float16", "bfloat16"],
     )
     parser.add_argument("--qwen-max-new-tokens", type=int, default=256)
-    parser.add_argument(
-        "--vllm-gpu-memory-utilization",
-        type=float,
-        default=0.9,
-    )
-    parser.add_argument("--vllm-max-num-seqs", type=int, default=0)
-    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=0)
-    parser.add_argument("--vllm-max-model-len", type=int, default=0)
     parser.add_argument("--vad-cache-dir", default=".cache/qwen_srt_vad")
     parser.add_argument("--no-vad-cache", action="store_true")
     return parser
@@ -83,13 +70,8 @@ def _build_runtime_config(ns: argparse.Namespace) -> TranscribeConfig:
         qwen_language=ns.qwen_language,
         qwen_context=ns.qwen_context,
         use_prompt=ns.use_prompt,
-        backend=ns.backend,
         qwen_dtype=ns.qwen_dtype,
         qwen_max_new_tokens=ns.qwen_max_new_tokens,
-        vllm_gpu_memory_utilization=ns.vllm_gpu_memory_utilization,
-        vllm_max_num_seqs=ns.vllm_max_num_seqs,
-        vllm_max_num_batched_tokens=ns.vllm_max_num_batched_tokens,
-        vllm_max_model_len=ns.vllm_max_model_len,
         vad_cache_dir=Path(ns.vad_cache_dir),
         use_vad_cache=not ns.no_vad_cache,
     )
@@ -137,13 +119,8 @@ def run_server(namespace: argparse.Namespace) -> None:
         "qwen_language": config.qwen_language,
         "qwen_context": config.qwen_context,
         "use_prompt": config.use_prompt,
-        "backend": config.backend,
         "qwen_dtype": config.qwen_dtype,
         "qwen_max_new_tokens": config.qwen_max_new_tokens,
-        "vllm_gpu_memory_utilization": config.vllm_gpu_memory_utilization,
-        "vllm_max_num_seqs": config.vllm_max_num_seqs,
-        "vllm_max_num_batched_tokens": config.vllm_max_num_batched_tokens,
-        "vllm_max_model_len": config.vllm_max_model_len,
         "vad_cache_dir": str(config.vad_cache_dir),
         "use_vad_cache": config.use_vad_cache,
     }

@@ -18,7 +18,6 @@ from .postprocess import CantonesePostProcessor, clean_asr_text
 from .runtime import (
     build_asr_model,
     build_vad_model,
-    resolve_backend,
     resolve_device,
     resolve_qwen_dtype,
     resolve_segment_batch_size,
@@ -34,7 +33,6 @@ class PreparedTranscriber:
     asr_model: Any
     vad_model: Any
     postprocessor: CantonesePostProcessor
-    asr_backend: str
     device: str
     vad_device: str
     segment_batch_size: int
@@ -146,16 +144,11 @@ def resolve_context_prompt(config: TranscribeConfig) -> tuple[str, bool]:
 
 
 def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
-    backend = resolve_backend(config.backend)
     resolved_device = resolve_device(config.device)
-    if backend == "transformers":
-        qwen_dtype = resolve_qwen_dtype(config.qwen_dtype, resolved_device)
-    else:
-        qwen_dtype = config.qwen_dtype
+    qwen_dtype = resolve_qwen_dtype(config.qwen_dtype, resolved_device)
     segment_batch_size = resolve_segment_batch_size(
         resolved_device,
         config.segment_batch_size,
-        backend=backend,
     )
     resolved_vad_workers = (
         config.vad_workers
@@ -170,9 +163,8 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
     context_prompt, use_prompt = resolve_context_prompt(config)
 
     asr_model = build_asr_model(config, resolved_device, qwen_dtype, segment_batch_size)
-    actual_backend = str(getattr(asr_model, "_gigacan_backend", backend))
 
-    print(f"ASR backend: {actual_backend}")
+    print("ASR backend: transformers")
     print(f"Using device: {resolved_device}")
     print(f"Using VAD device: {vad_device}")
     print(f"Qwen dtype: {qwen_dtype}")
@@ -184,7 +176,6 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         asr_model=asr_model,
         vad_model=vad_model,
         postprocessor=CantonesePostProcessor(),
-        asr_backend=actual_backend,
         device=resolved_device,
         vad_device=vad_device,
         segment_batch_size=segment_batch_size,
@@ -300,9 +291,6 @@ def resolve_super_batch_active_files(
         return max_active_files
 
     if runtime.device.startswith("cuda"):
-        if runtime.asr_backend == "vllm":
-            # Conservative default to avoid high host RAM pressure on long files.
-            return max(4, min(8, runtime.segment_batch_size // 24))
         return max(3, min(8, runtime.segment_batch_size // 32))
     return max(2, min(6, runtime.segment_batch_size // 2))
 
@@ -317,7 +305,7 @@ def resolve_logical_cpu_count() -> int:
 def resolve_cpu_worker_budget(runtime: PreparedTranscriber) -> int:
     cpu_count = resolve_logical_cpu_count()
     if runtime.device.startswith("cuda"):
-        # Leave more room for vLLM + system processes to keep runs stable.
+        # Leave room for system processes to keep long runs stable.
         reserve_cores = max(2, cpu_count // 4)
     else:
         reserve_cores = 1 if cpu_count >= 4 else 0
@@ -358,9 +346,6 @@ def resolve_prep_workers(runtime: PreparedTranscriber) -> int:
         return runtime.prep_workers
     cpu_budget = resolve_cpu_worker_budget(runtime)
     if runtime.device.startswith("cuda"):
-        if runtime.asr_backend == "vllm":
-            # Keep prep moderate; oversubscription can hurt RAM/cache behavior.
-            return max(2, min(4, cpu_budget // 4))
         return max(2, min(6, cpu_budget // 3))
     return 1
 
@@ -373,9 +358,6 @@ def resolve_vad_workers(runtime: PreparedTranscriber) -> int:
     if runtime.device.startswith("cuda"):
         # Spend remaining CPU budget on VAD to keep the GPU input queue filled.
         remaining_workers = max(2, cpu_budget - prep_workers)
-        if runtime.asr_backend == "vllm":
-            # Cap VAD workers to avoid per-worker model memory blowups.
-            return max(2, min(4, remaining_workers))
         return max(2, min(8, remaining_workers))
     return 2
 

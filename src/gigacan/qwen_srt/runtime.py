@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import sysconfig
 from pathlib import Path
 from typing import Any
 
@@ -14,15 +13,6 @@ from transformers import AutoProcessor
 from .config import TranscribeConfig
 
 
-def resolve_backend(backend_arg: str) -> str:
-    backend = backend_arg.strip().lower()
-    if backend not in {"vllm", "transformers"}:
-        raise ValueError(
-            f"Unsupported backend: {backend_arg}. Expected one of: vllm, transformers."
-        )
-    return backend
-
-
 def resolve_device(device_arg: str) -> str:
     if device_arg != "auto":
         return device_arg
@@ -31,16 +21,11 @@ def resolve_device(device_arg: str) -> str:
     return "cpu"
 
 
-def resolve_segment_batch_size(
-    device: str,
-    batch_size_arg: int,
-    *,
-    backend: str,
-) -> int:
+def resolve_segment_batch_size(device: str, batch_size_arg: int) -> int:
     if batch_size_arg > 0:
         return batch_size_arg
     if device.startswith("cuda"):
-        return 256 if backend == "vllm" else 128
+        return 128
     return 4
 
 
@@ -54,17 +39,6 @@ def resolve_qwen_dtype(dtype_arg: str, device: str) -> torch.dtype:
     if dtype_arg == "bfloat16":
         return torch.bfloat16
     raise ValueError(f"Unsupported dtype: {dtype_arg}")
-
-
-def check_vllm_prerequisites() -> tuple[bool, str]:
-    include_dir = Path(sysconfig.get_paths().get("include", ""))
-    header = include_dir / "Python.h"
-    if not header.is_file():
-        return (
-            False,
-            f"Missing Python headers ({header}). Install python3-dev / python3.12-dev.",
-        )
-    return True, ""
 
 
 def ensure_qwen_source(src_dir: Path, repo_url: str) -> Path:
@@ -196,85 +170,24 @@ def move_qwen_model_to_device(qwen_model: Any, device: str) -> None:
     qwen_model.dtype = qwen_model.model.dtype
 
 
-def prepare_qwen_runtime(
-    src_dir: Path,
-    repo_url: str,
-    *,
-    enable_transformers_compat: bool,
-) -> None:
+def prepare_qwen_runtime(src_dir: Path, repo_url: str) -> None:
     qwen_src_dir = ensure_qwen_source(src_dir, repo_url)
     if str(qwen_src_dir) not in sys.path:
         sys.path.insert(0, str(qwen_src_dir))
-    if enable_transformers_compat:
-        ensure_qwen_transformers_compat()
+    ensure_qwen_transformers_compat()
 
 
 def build_asr_model(
     config: TranscribeConfig,
     resolved_device: str,
-    qwen_dtype: torch.dtype | str,
+    qwen_dtype: torch.dtype,
     segment_batch_size: int,
 ) -> Any:
-    backend = resolve_backend(config.backend)
-    prepare_qwen_runtime(
-        config.qwen_src_dir,
-        config.qwen_repo_url,
-        enable_transformers_compat=backend == "transformers",
-    )
-
-    from qwen_asr import Qwen3ASRModel
-
-    if backend == "vllm":
-        if not resolved_device.startswith("cuda"):
-            raise ValueError(
-                'The "vllm" backend requires CUDA. Use --device cuda:0 or switch to --backend transformers.'
-            )
-        ready, reason = check_vllm_prerequisites()
-        if ready:
-            vllm_kwargs: dict[str, Any] = {
-                "gpu_memory_utilization": config.vllm_gpu_memory_utilization,
-            }
-            if config.vllm_max_num_seqs > 0:
-                vllm_kwargs["max_num_seqs"] = config.vllm_max_num_seqs
-            if config.vllm_max_num_batched_tokens > 0:
-                vllm_kwargs["max_num_batched_tokens"] = (
-                    config.vllm_max_num_batched_tokens
-                )
-            if config.vllm_max_model_len > 0:
-                vllm_kwargs["max_model_len"] = config.vllm_max_model_len
-            if config.qwen_dtype != "auto":
-                vllm_kwargs["dtype"] = config.qwen_dtype
-            try:
-                llm_model = Qwen3ASRModel.LLM(
-                    model=config.qwen_model,
-                    max_inference_batch_size=segment_batch_size,
-                    max_new_tokens=config.qwen_max_new_tokens,
-                    **vllm_kwargs,
-                )
-                setattr(llm_model, "_gigacan_backend", "vllm")
-                return llm_model
-            except ImportError as exc:
-                raise RuntimeError(
-                    "vLLM backend requested but not available. Install with `pip install qwen-asr[vllm]` or `pip install vllm`."
-                ) from exc
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    "Warning: vLLM backend initialization failed; falling back to transformers backend."
-                )
-                print(f"vLLM error: {exc}")
-                print(
-                    "Hint: install Python development headers (python3-dev / python3.12-dev) if you want vLLM."
-                )
-        else:
-            print(
-                "Warning: vLLM prerequisites are not met; falling back to transformers backend."
-            )
-            print(f"Reason: {reason}")
-        backend = "transformers"
-        qwen_dtype = resolve_qwen_dtype(config.qwen_dtype, resolved_device)
-
     if not isinstance(qwen_dtype, torch.dtype):
         raise TypeError(f"Expected torch.dtype for transformers backend, got {qwen_dtype}")
+
+    prepare_qwen_runtime(config.qwen_src_dir, config.qwen_repo_url)
+    from qwen_asr import Qwen3ASRModel
 
     ensure_qwen_config_compat()
     ensure_qwen_modeling_compat()
@@ -299,7 +212,6 @@ def build_asr_model(
         max_new_tokens=config.qwen_max_new_tokens,
     )
     move_qwen_model_to_device(asr_model, resolved_device)
-    setattr(asr_model, "_gigacan_backend", "transformers")
     if hasattr(asr_model.model, "generation_config"):
         eos_token_id = getattr(asr_model.model.generation_config, "eos_token_id", None)
         if isinstance(eos_token_id, list) and eos_token_id:

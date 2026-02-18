@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "ASR batch size for VAD segments. "
-            "0 = auto (vLLM GPU:256, transformers GPU:128, CPU:4)."
+            "0 = auto (GPU:128, CPU:4)."
         ),
     )
     parser.add_argument(
@@ -206,47 +206,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=["auto", "float32", "float16", "bfloat16"],
         help=(
-            'Model dtype. For vLLM: passed through as dtype. '
-            'For transformers: "auto" uses bfloat16 on CUDA and float32 on CPU.'
-        ),
-    )
-    parser.add_argument(
-        "--backend",
-        default="vllm",
-        choices=["vllm", "transformers"],
-        help='ASR backend. Default: "vllm".',
-    )
-    parser.add_argument(
-        "--vllm-gpu-memory-utilization",
-        type=float,
-        default=0.9,
-        help="vLLM GPU memory utilization ratio (0.0-1.0). Default: 0.9.",
-    )
-    parser.add_argument(
-        "--vllm-max-num-seqs",
-        type=int,
-        default=0,
-        help=(
-            "Optional vLLM scheduler max_num_seqs. "
-            "0 = vLLM default."
-        ),
-    )
-    parser.add_argument(
-        "--vllm-max-num-batched-tokens",
-        type=int,
-        default=0,
-        help=(
-            "Optional vLLM scheduler max_num_batched_tokens. "
-            "0 = vLLM default."
-        ),
-    )
-    parser.add_argument(
-        "--vllm-max-model-len",
-        type=int,
-        default=0,
-        help=(
-            "Optional vLLM max_model_len. "
-            "0 = model default."
+            'Model dtype for transformers backend. '
+            '"auto" uses bfloat16 on CUDA and float32 on CPU.'
         ),
     )
     parser.add_argument(
@@ -320,14 +281,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--vad-workers must be >= 0.")
     if namespace.asr_prefetch_batches < 1:
         parser.error("--asr-prefetch-batches must be >= 1.")
-    if not 0 < namespace.vllm_gpu_memory_utilization <= 1:
-        parser.error("--vllm-gpu-memory-utilization must be in (0, 1].")
-    if namespace.vllm_max_num_seqs < 0:
-        parser.error("--vllm-max-num-seqs must be >= 0.")
-    if namespace.vllm_max_num_batched_tokens < 0:
-        parser.error("--vllm-max-num-batched-tokens must be >= 0.")
-    if namespace.vllm_max_model_len < 0:
-        parser.error("--vllm-max-model-len must be >= 0.")
     return namespace
 
 
@@ -356,13 +309,8 @@ def build_config(
         qwen_language=namespace.qwen_language,
         qwen_context=namespace.qwen_context,
         use_prompt=namespace.use_prompt,
-        backend=namespace.backend,
         qwen_dtype=namespace.qwen_dtype,
         qwen_max_new_tokens=namespace.qwen_max_new_tokens,
-        vllm_gpu_memory_utilization=namespace.vllm_gpu_memory_utilization,
-        vllm_max_num_seqs=namespace.vllm_max_num_seqs,
-        vllm_max_num_batched_tokens=namespace.vllm_max_num_batched_tokens,
-        vllm_max_model_len=namespace.vllm_max_model_len,
         vad_cache_dir=Path(namespace.vad_cache_dir),
         use_vad_cache=not namespace.no_vad_cache,
     )

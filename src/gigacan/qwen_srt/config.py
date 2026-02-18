@@ -31,12 +31,7 @@ class TranscribeConfig:
     qwen_language: str = "Cantonese"
     qwen_context: str = DEFAULT_QWEN_CONTEXT_PROMPT
     use_prompt: bool = False
-    backend: str = "vllm"
     qwen_dtype: str = "auto"
     qwen_max_new_tokens: int = 256
-    vllm_gpu_memory_utilization: float = 0.9
-    vllm_max_num_seqs: int = 0
-    vllm_max_num_batched_tokens: int = 0
-    vllm_max_model_len: int = 0
     vad_cache_dir: Path = Path(".cache/qwen_srt_vad")
     use_vad_cache: bool = True
