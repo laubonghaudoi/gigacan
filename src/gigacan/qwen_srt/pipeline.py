@@ -144,7 +144,15 @@ def resolve_context_prompt(config: TranscribeConfig) -> tuple[str, bool]:
 
 
 def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
+    resolved_backend = config.asr_backend.strip().lower()
+    if resolved_backend not in {"transformers", "vllm"}:
+        raise ValueError(f"Unsupported ASR backend: {config.asr_backend}")
     resolved_device = resolve_device(config.device)
+    if resolved_backend == "vllm" and not resolved_device.startswith("cuda"):
+        raise RuntimeError(
+            f"vLLM backend requires CUDA, got resolved device {resolved_device!r}. "
+            "Use --asr-backend transformers on CPU."
+        )
     qwen_dtype = resolve_qwen_dtype(config.qwen_dtype, resolved_device)
     segment_batch_size = resolve_segment_batch_size(
         resolved_device,
@@ -155,19 +163,29 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         if config.vad_workers > 0
         else (4 if resolved_device.startswith("cuda") else 2)
     )
-    vad_device = (
-        "cpu"
-        if resolved_device.startswith("cuda") and resolved_vad_workers > 1
+    aux_device = (
+        "cuda:0"
+        if resolved_backend == "vllm" and resolved_device.startswith("cuda")
         else resolved_device
+    )
+    vad_device = (
+        "cpu" if aux_device.startswith("cuda") and resolved_vad_workers > 1 else aux_device
     )
     context_prompt, use_prompt = resolve_context_prompt(config)
 
     asr_model = build_asr_model(config, resolved_device, qwen_dtype, segment_batch_size)
 
-    print("ASR backend: transformers")
+    print(f"ASR backend: {resolved_backend}")
     print(f"Using device: {resolved_device}")
     print(f"Using VAD device: {vad_device}")
-    print(f"Qwen dtype: {qwen_dtype}")
+    if resolved_backend == "transformers":
+        print(f"Qwen dtype: {qwen_dtype}")
+    else:
+        print(
+            "vLLM settings: "
+            f"gpu_memory_utilization={config.vllm_gpu_memory_utilization}, "
+            f"tensor_parallel_size={config.vllm_tensor_parallel_size}"
+        )
     print(f"Segment batch size: {segment_batch_size}")
     print(f"Qwen context prompt: {'enabled' if use_prompt else 'disabled'}")
 

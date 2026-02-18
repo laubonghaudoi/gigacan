@@ -15,6 +15,7 @@ class TranscribeConfig:
 
     audio: Path
     output_srt: Path
+    asr_backend: str = "vllm"
     device: str = "auto"
     segment_batch_size: int = 0
     min_segment_ms: int = 300
@@ -32,6 +33,8 @@ class TranscribeConfig:
     qwen_context: str = DEFAULT_QWEN_CONTEXT_PROMPT
     use_prompt: bool = False
     qwen_dtype: str = "auto"
+    vllm_gpu_memory_utilization: float = 0.7
+    vllm_tensor_parallel_size: int = 1
     qwen_max_new_tokens: int = 256
     vad_cache_dir: Path = Path(".cache/qwen_srt_vad")
     use_vad_cache: bool = True

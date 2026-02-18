@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -183,6 +184,25 @@ def build_asr_model(
     qwen_dtype: torch.dtype,
     segment_batch_size: int,
 ) -> Any:
+    backend = config.asr_backend.strip().lower()
+    if backend == "vllm":
+        return build_asr_model_vllm(config, resolved_device, segment_batch_size)
+    if backend == "transformers":
+        return build_asr_model_transformers(
+            config,
+            resolved_device,
+            qwen_dtype,
+            segment_batch_size,
+        )
+    raise ValueError(f"Unsupported ASR backend: {config.asr_backend}")
+
+
+def build_asr_model_transformers(
+    config: TranscribeConfig,
+    resolved_device: str,
+    qwen_dtype: torch.dtype,
+    segment_batch_size: int,
+) -> Any:
     if not isinstance(qwen_dtype, torch.dtype):
         raise TypeError(f"Expected torch.dtype for transformers backend, got {qwen_dtype}")
 
@@ -217,6 +237,60 @@ def build_asr_model(
         if isinstance(eos_token_id, list) and eos_token_id:
             asr_model.model.generation_config.pad_token_id = eos_token_id[-1]
     return asr_model
+
+
+def resolve_vllm_device(device: str) -> str:
+    if device == "cuda":
+        return "cuda:0"
+    if device.startswith("cuda:"):
+        _, _, raw_idx = device.partition(":")
+        if raw_idx.isdigit():
+            idx = int(raw_idx)
+            if idx == 0:
+                return "cuda:0"
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if visible and visible != raw_idx:
+                raise RuntimeError(
+                    "vLLM backend requires CUDA_VISIBLE_DEVICES to match the selected "
+                    f"device index. Got --device={device}, "
+                    f"CUDA_VISIBLE_DEVICES={visible!r}."
+                )
+            if not visible:
+                os.environ["CUDA_VISIBLE_DEVICES"] = raw_idx
+            return "cuda:0"
+    raise RuntimeError(
+        f"vLLM backend requires a CUDA device, got {device!r}. "
+        "Use --device auto/cuda/cuda:N, or choose --asr-backend transformers."
+    )
+
+
+def build_asr_model_vllm(
+    config: TranscribeConfig,
+    resolved_device: str,
+    segment_batch_size: int,
+) -> Any:
+    if not resolved_device.startswith("cuda"):
+        raise RuntimeError(
+            f"vLLM backend requires CUDA, got resolved device {resolved_device!r}. "
+            "Use --asr-backend transformers on CPU."
+        )
+    resolve_vllm_device(resolved_device)
+    prepare_qwen_runtime(config.qwen_src_dir, config.qwen_repo_url)
+    try:
+        from qwen_asr import Qwen3ASRModel
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Failed to import Qwen3ASRModel for vLLM backend. "
+            "Install dependencies with `pip install -U qwen-asr[vllm] vllm`."
+        ) from exc
+
+    return Qwen3ASRModel.LLM(
+        model=config.qwen_model,
+        gpu_memory_utilization=config.vllm_gpu_memory_utilization,
+        tensor_parallel_size=config.vllm_tensor_parallel_size,
+        max_inference_batch_size=segment_batch_size,
+        max_new_tokens=config.qwen_max_new_tokens,
+    )
 
 
 def build_vad_model(device: str, vad_max_segment_ms: int) -> Any:

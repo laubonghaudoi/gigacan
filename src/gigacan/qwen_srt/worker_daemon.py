@@ -36,6 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="https://github.com/QwenLM/Qwen3-ASR",
     )
     parser.add_argument("--qwen-model", default="Qwen/Qwen3-ASR-1.7B")
+    parser.add_argument(
+        "--asr-backend",
+        default="vllm",
+        choices=["vllm", "transformers"],
+    )
     parser.add_argument("--qwen-language", default="Cantonese")
     parser.add_argument("--qwen-context", default="")
     parser.add_argument("--use-prompt", action="store_true")
@@ -44,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=["auto", "float32", "float16", "bfloat16"],
     )
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.7)
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=256)
     parser.add_argument("--vad-cache-dir", default=".cache/qwen_srt_vad")
     parser.add_argument("--no-vad-cache", action="store_true")
@@ -67,10 +74,13 @@ def _build_runtime_config(ns: argparse.Namespace) -> TranscribeConfig:
         qwen_src_dir=Path(ns.qwen_src_dir),
         qwen_repo_url=ns.qwen_repo_url,
         qwen_model=ns.qwen_model,
+        asr_backend=ns.asr_backend,
         qwen_language=ns.qwen_language,
         qwen_context=ns.qwen_context,
         use_prompt=ns.use_prompt,
         qwen_dtype=ns.qwen_dtype,
+        vllm_gpu_memory_utilization=ns.vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=ns.vllm_tensor_parallel_size,
         qwen_max_new_tokens=ns.qwen_max_new_tokens,
         vad_cache_dir=Path(ns.vad_cache_dir),
         use_vad_cache=not ns.no_vad_cache,
@@ -116,10 +126,13 @@ def run_server(namespace: argparse.Namespace) -> None:
         "qwen_src_dir": str(config.qwen_src_dir),
         "qwen_repo_url": config.qwen_repo_url,
         "qwen_model": config.qwen_model,
+        "asr_backend": config.asr_backend,
         "qwen_language": config.qwen_language,
         "qwen_context": config.qwen_context,
         "use_prompt": config.use_prompt,
         "qwen_dtype": config.qwen_dtype,
+        "vllm_gpu_memory_utilization": config.vllm_gpu_memory_utilization,
+        "vllm_tensor_parallel_size": config.vllm_tensor_parallel_size,
         "qwen_max_new_tokens": config.qwen_max_new_tokens,
         "vad_cache_dir": str(config.vad_cache_dir),
         "use_vad_cache": config.use_vad_cache,

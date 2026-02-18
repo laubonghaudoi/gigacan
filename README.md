@@ -32,7 +32,9 @@
 
 1. `uv run transcribe`（預設會遞迴掃描 `download/`，並將字幕輸出到 `transcriptions/<year>/*.srt`）
 1. 只跑某一年：`uv run transcribe --year 2025`
-1. 目前固定使用 transformers backend（CUDA 可用時會用 `cuda:0`，否則自動回落 CPU）
+1. 預設使用 `vllm` backend；可用 `--asr-backend transformers` 切換
+1. `vllm` 可調：`--vllm-gpu-memory-utilization`、`--vllm-tensor-parallel-size`
+1. `transformers` 可調：`--qwen-dtype`（`auto`=CUDA 用 `bfloat16`，CPU 用 `float32`）
 1. 單檔模式：`uv run transcribe --audio download/2026/J-ajS2LNnfs.opus --output-srt ./no_prompt.srt`
 1. 針對影片類別修改 system  prompt，然後跑 `2_vtt.py`，會用 silero-vad 將輸入音頻分段再叫 qwen3-asr-flash 轉寫成粵文，生成 .vtt 字幕文件到 `vtt/`。
     1. 記得修改 `2_vtt.py` 入面嘅 prompt，會對字幕準確度有好大影響。
@@ -42,7 +44,7 @@
 1. 刪除 `download`/ 同埋 `vtt/`入面嘅文檔，開始下一個播放清單重複以上步驟。
 
 
-## 3 轉寫優化記錄（2026-02-17 更新）
+## 3 轉寫優化記錄（2026-02-18 更新）
 
 以下係目前已經落地嘅所有轉寫優化：
 
@@ -55,8 +57,10 @@
    1. 預設 skip 已存在 `.srt`（除非 `--overwrite`），中斷後可直接續跑。
    1. `write_srt` 採用臨時文件 + `os.replace` 原子寫入，避免中斷時留下破損 SRT。
 1. **ASR 後端**
-   1. 目前固定使用 `transformers`。
-   1. `--qwen-dtype auto`：CUDA 會用 `bfloat16`，CPU 會用 `float32`。
+   1. 支援 `vllm` 同 `transformers` 兩種 backend。
+   1. 預設 backend 係 `vllm`；`transformers` 可用 `--asr-backend transformers` 切換。
+   1. `--qwen-dtype auto`：CUDA 會用 `bfloat16`，CPU 會用 `float32`（transformers backend）。
+   1. `vllm` 可用 `--vllm-gpu-memory-utilization` 同 `--vllm-tensor-parallel-size` 微調。
 1. **Persistent Worker（常駐進程）**
    1. 支援 UNIX socket 常駐 worker，重用已載入模型，減少反覆冷啟動。
    1. 支援 `ping/shutdown` 同 runtime signature 檢查；配置改變會自動重啟 worker。
@@ -82,10 +86,11 @@
 1. **進度掃描整合**
    1. `legco.csv` 新增 `transcribed` 欄位。
    1. `2_scan_progress.py` 已同步掃描 `transcriptions/**/*.srt` 並更新 `transcribed`。
-1. **基準測試（2013 年全集，14 files，約 15.40 小時音頻）**
-   1. vLLM（穩定配置）：`112.87s`，約 `491.32x` realtime。
-   1. transformers（同等流程配置）：`342.48s`，約 `161.92x` realtime。
-   1. vLLM 相對 transformers 約 `3.03x` 提速。
+1. **基準測試（2013 年全集，14 files，約 15.40 小時音頻，2026-02-18 warm-run）**
+   1. vLLM（persistent worker warm-run）：`96.35s`，約 `575.56x` realtime。
+   1. transformers（同等流程 + persistent worker warm-run）：`337.42s`，約 `164.35x` realtime。
+   1. vLLM 相對 transformers 約 `3.50x` 提速。
+   1. 詳細報告：`benchmarks/benchmark_2013_20260218_072910.md`。
    1. 再盲目加大 RAM window（例如 active/preload/workers 全面上推）未必更快，曾觀察到吞吐反而下降。
 
 

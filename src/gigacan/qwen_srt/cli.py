@@ -187,6 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
         help='Hugging Face model id or local path. Default: "Qwen/Qwen3-ASR-1.7B".',
     )
     parser.add_argument(
+        "--asr-backend",
+        default="vllm",
+        choices=["vllm", "transformers"],
+        help='ASR backend: "vllm" (default) or "transformers".',
+    )
+    parser.add_argument(
         "--qwen-language",
         default="Cantonese",
         help='Forced language for Qwen ASR. Default: "Cantonese".',
@@ -208,6 +214,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             'Model dtype for transformers backend. '
             '"auto" uses bfloat16 on CUDA and float32 on CPU.'
+        ),
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.7,
+        help=(
+            "vLLM-only: GPU memory utilization target passed to "
+            "Qwen3ASRModel.LLM. Default: 0.7."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=1,
+        help=(
+            "vLLM-only: tensor parallel size passed to Qwen3ASRModel.LLM. "
+            "Default: 1."
         ),
     )
     parser.add_argument(
@@ -281,6 +305,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--vad-workers must be >= 0.")
     if namespace.asr_prefetch_batches < 1:
         parser.error("--asr-prefetch-batches must be >= 1.")
+    if namespace.vllm_tensor_parallel_size < 1:
+        parser.error("--vllm-tensor-parallel-size must be >= 1.")
+    if (
+        namespace.vllm_gpu_memory_utilization <= 0.0
+        or namespace.vllm_gpu_memory_utilization > 1.0
+    ):
+        parser.error("--vllm-gpu-memory-utilization must be in (0, 1].")
     return namespace
 
 
@@ -306,10 +337,13 @@ def build_config(
         qwen_src_dir=Path(namespace.qwen_src_dir),
         qwen_repo_url=namespace.qwen_repo_url,
         qwen_model=namespace.qwen_model,
+        asr_backend=namespace.asr_backend,
         qwen_language=namespace.qwen_language,
         qwen_context=namespace.qwen_context,
         use_prompt=namespace.use_prompt,
         qwen_dtype=namespace.qwen_dtype,
+        vllm_gpu_memory_utilization=namespace.vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=namespace.vllm_tensor_parallel_size,
         qwen_max_new_tokens=namespace.qwen_max_new_tokens,
         vad_cache_dir=Path(namespace.vad_cache_dir),
         use_vad_cache=not namespace.no_vad_cache,
