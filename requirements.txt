@@ -13,3 +13,5 @@ torch
 torchaudio
 opencc
 funasr
+vllm
+qwen-asr[vllm]

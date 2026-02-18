@@ -30,6 +30,10 @@
 
 ## 2 轉寫字幕
 
+1. `uv run transcribe`（預設會遞迴掃描 `download/`，並將字幕輸出到 `transcriptions/<year>/*.srt`）
+1. 只跑某一年：`uv run transcribe --year 2025`
+1. 預設用 vLLM backend（`--vllm-gpu-memory-utilization` 預設 0.9）；如果冇 CUDA 可以改用：`uv run transcribe --backend transformers`
+1. 單檔模式：`uv run transcribe --audio download/2026/J-ajS2LNnfs.opus --output-srt ./no_prompt.srt`
 1. 針對影片類別修改 system  prompt，然後跑 `2_vtt.py`，會用 silero-vad 將輸入音頻分段再叫 qwen3-asr-flash 轉寫成粵文，生成 .vtt 字幕文件到 `vtt/`。
     1. 記得修改 `2_vtt.py` 入面嘅 prompt，會對字幕準確度有好大影響。
     1. 唔同題材需要設定唔同嘅`--vad-merge-ms`時長，例如張悦楷三國演義最優大概係 450，而毛澤東的黃昏歲月就最好係 500。推薦每加一個新題材之前用`tune_vad.ipynb`嚟確定最優值。
@@ -37,18 +41,53 @@
 1. 讀取 `cut/` 入面切分好嘅音頻，上傳數據集到 HuggingFace
 1. 刪除 `download`/ 同埋 `vtt/`入面嘅文檔，開始下一個播放清單重複以上步驟。
 
-下面係命令。跑之前要創建 venv 安裝好依賴，然後開個 `.env` 放阿里雲個 `API_KEY=` 入去。跟住你要去 GCP 開個 YouTube API key，放個 `YOUTUBE_API_KEY` 嚟獲取 YouTube 影片數據。
 
-```bash
+## 3 轉寫優化記錄（2026-02-17 更新）
 
-# 下載播放列表或者頻道所有視頻
-python3 1_get_video_list.py
-# 修改 system prompt 並且調整 --vad-merge-ms，然後生成字幕
-python3 2_vtt.py
-# 用生成嘅 vtt 字幕切分
-python3
-```
+以下係目前已經落地嘅所有轉寫優化：
 
+1. **批量流程 + CLI 能力**
+   1. `transcribe` 支援遞迴掃描 `download/`，輸出到 `transcriptions/<year>/*.srt`。
+   1. 支援 `--year` 只跑某一年。
+   1. 支援單檔模式同批量模式共存。
+   1. 進度條改為整體文件級進度（總文件數 + 已完成/失敗）。
+1. **可恢復（resumable）機制**
+   1. 預設 skip 已存在 `.srt`（除非 `--overwrite`），中斷後可直接續跑。
+   1. `write_srt` 採用臨時文件 + `os.replace` 原子寫入，避免中斷時留下破損 SRT。
+1. **ASR 後端升級**
+   1. 後端支援 `vllm` / `transformers`（預設 `vllm`）。
+   1. vLLM 支援參數：`--vllm-gpu-memory-utilization`、`--vllm-max-num-seqs`、`--vllm-max-num-batched-tokens`、`--vllm-max-model-len`。
+   1. 若 vLLM prerequisites 唔滿足或者初始化失敗，會 fallback 去 transformers。
+1. **Persistent Worker（常駐進程）**
+   1. 支援 UNIX socket 常駐 worker，重用已載入模型，減少反覆冷啟動。
+   1. 支援 `ping/shutdown` 同 runtime signature 檢查；配置改變會自動重啟 worker。
+1. **跨文件 Super-batching（核心提速）**
+   1. 實作 global cross-file segment queue，唔再單文件串行餵 GPU。
+   1. 引入 frame-aware batch 選擇，降低 padding 浪費。
+   1. 支援 ASR payload prefetch（`--asr-prefetch-batches`）做 CPU/GPU pipeline overlap。
+   1. 新增長短文件交錯排序（唔再純長檔優先）減少記憶體尖峰。
+1. **CPU / VAD 並行化**
+   1. decode prep + VAD 採用 thread pools（`--prep-workers` / `--vad-workers`）。
+   1. GPU ASR 場景下可將 VAD 放 CPU，減少同 GPU 推理互搶。
+1. **VAD 優化**
+   1. 新增 VAD cache（`.cache/qwen_srt_vad`），重跑可重用已做過 VAD 結果。
+   1. 支援短 segment 過濾 + segment merge（`merge-target/max/gap`）降低碎片化。
+1. **穩定性與容錯**
+   1. `--continue-on-error` 允許大批量任務容錯繼續跑。
+   1. ASR batch 出錯時有 binary-split fallback，盡量隔離壞樣本而唔係全批中止。
+1. **記憶體壓力治理**
+   1. decode backlog 有上限，避免 decoded audio 無上限堆積。
+   1. 新增 decoded audio RAM budget（`--super-batch-max-decoded-gib`，`0`=auto），producer 會按預算 backpressure。
+   1. 目前 full-run 穩定配置（RTX 5090 + 58GiB RAM 實測）：
+      `--prep-workers 4 --vad-workers 4 --super-batch-active-files 8 --super-batch-preload-files 10 --super-batch-max-decoded-gib 6`
+1. **進度掃描整合**
+   1. `legco.csv` 新增 `transcribed` 欄位。
+   1. `2_scan_progress.py` 已同步掃描 `transcriptions/**/*.srt` 並更新 `transcribed`。
+1. **基準測試（2013 年全集，14 files，約 15.40 小時音頻）**
+   1. vLLM（穩定配置）：`112.87s`，約 `491.32x` realtime。
+   1. transformers（同等流程配置）：`342.48s`，約 `161.92x` realtime。
+   1. vLLM 相對 transformers 約 `3.03x` 提速。
+   1. 再盲目加大 RAM window（例如 active/preload/workers 全面上推）未必更快，曾觀察到吞吐反而下降。
 
 
 

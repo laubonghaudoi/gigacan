@@ -14,6 +14,7 @@ from pandas import DataFrame
 # --- CONFIGURATION ---
 CSV_FILE = Path("legco.csv")
 DOWNLOAD_DIR = Path("download")
+TRANSCRIPTIONS_DIR = Path("transcriptions")
 YUE_SUBTITLE_DIR = Path("yue")
 ZH_HK_SUBTITLE_DIR = Path("zh-hk")
 SUBTITLE_TARGET_CONFIG = {
@@ -27,6 +28,7 @@ SUBTITLE_TARGET_CONFIG = {
     },
 }
 SUBTITLE_EXTENSIONS = {".srt", ".vtt", ".ass", ".ttml", ".lrc", ".json3"}
+TRANSCRIBED_COLUMN = "transcribed"
 # --- END CONFIGURATION ---
 
 
@@ -63,6 +65,19 @@ def _load_downloaded_ids(download_dir: Path) -> set[str]:
         if path.is_file():
             downloaded_ids.add(path.stem)
     return downloaded_ids
+
+
+def _load_transcribed_ids(transcriptions_dir: Path) -> set[str]:
+    """Return the set of video IDs inferred from ``transcriptions_dir`` SRT files."""
+
+    transcribed_ids: set[str] = set()
+    if not transcriptions_dir.is_dir():
+        return transcribed_ids
+
+    for path in transcriptions_dir.rglob("*.srt"):
+        if path.is_file():
+            transcribed_ids.add(path.stem)
+    return transcribed_ids
 
 
 def _normalise_lang(value: str) -> str:
@@ -129,20 +144,34 @@ def _is_marked_downloaded(value: object) -> bool:
     return False
 
 
-def _ensure_download_column(df: DataFrame) -> None:
+def _ensure_download_column(df: DataFrame) -> bool:
+    changed = False
     if "downloaded" not in df.columns:
         df["downloaded"] = False
+        changed = True
+    return changed
 
 
-def _ensure_subtitle_columns(df: DataFrame) -> None:
+def _ensure_subtitle_columns(df: DataFrame) -> bool:
+    changed = False
     for column in SUBTITLE_TARGET_CONFIG:
         if column not in df.columns:
             df[column] = False
+            changed = True
+    return changed
+
+
+def _ensure_transcribed_column(df: DataFrame) -> bool:
+    if TRANSCRIBED_COLUMN not in df.columns:
+        df[TRANSCRIBED_COLUMN] = False
+        return True
+    return False
 
 
 def scan_and_update_progress(
     download_dir: Path = DOWNLOAD_DIR,
     csv_path: Path = CSV_FILE,
+    transcriptions_dir: Path = TRANSCRIPTIONS_DIR,
 ) -> None:
     """
     Scan the download directory and update the metadata CSV to match reality.
@@ -157,6 +186,11 @@ def scan_and_update_progress(
     downloaded_ids = _load_downloaded_ids(download_dir)
     print(
         f"Found {len(downloaded_ids)} downloaded audio files across all subdirectories."
+    )
+    print(f"Scanning for transcriptions in '{transcriptions_dir}'...")
+    transcribed_ids = _load_transcribed_ids(transcriptions_dir)
+    print(
+        f"Found {len(transcribed_ids)} transcribed SRT files across all subdirectories."
     )
     print(
         "Scanning subtitles in configured roots: "
@@ -179,13 +213,18 @@ def scan_and_update_progress(
         print(f"Error reading CSV file '{csv_path}': {exc}")
         return
 
-    _ensure_download_column(df)
-    _ensure_subtitle_columns(df)
+    schema_changed = False
+    schema_changed = _ensure_download_column(df) or schema_changed
+    schema_changed = _ensure_subtitle_columns(df) or schema_changed
+    schema_changed = _ensure_transcribed_column(df) or schema_changed
 
     audio_updates = 0
+    transcribed_true_updates = 0
+    transcribed_false_updates = 0
     subtitle_true_updates = {column: 0 for column in SUBTITLE_TARGET_CONFIG}
     subtitle_false_updates = {column: 0 for column in SUBTITLE_TARGET_CONFIG}
     missing_audio_count = 0
+    missing_transcribed_count = 0
     missing_subtitle_count = {column: 0 for column in SUBTITLE_TARGET_CONFIG}
 
     records = df.to_dict(orient="records")
@@ -203,6 +242,17 @@ def scan_and_update_progress(
             df.loc[index_label, "downloaded"] = True
             audio_updates += 1
 
+        is_transcribed_marked = _is_marked_downloaded(
+            cast(object, record.get(TRANSCRIBED_COLUMN))
+        )
+        if is_transcribed_marked and (video_id not in transcribed_ids):
+            missing_transcribed_count += 1
+            df.loc[index_label, TRANSCRIBED_COLUMN] = False
+            transcribed_false_updates += 1
+        elif not is_transcribed_marked and (video_id in transcribed_ids):
+            df.loc[index_label, TRANSCRIBED_COLUMN] = True
+            transcribed_true_updates += 1
+
         for column in SUBTITLE_TARGET_CONFIG:
             is_subtitle_marked = _is_marked_downloaded(cast(object, record.get(column)))
             subtitle_ids = subtitle_ids_by_column[column]
@@ -216,13 +266,17 @@ def scan_and_update_progress(
 
     total_updates = (
         audio_updates
+        + transcribed_true_updates
+        + transcribed_false_updates
         + sum(subtitle_true_updates.values())
         + sum(subtitle_false_updates.values())
     )
-    if total_updates:
+    if total_updates or schema_changed:
         print(
             "Updating CSV rows "
             + f"(downloaded=True: {audio_updates}, "
+            + f"transcribed=True: {transcribed_true_updates}, "
+            + f"transcribed=False: {transcribed_false_updates}, "
             + f"subtitle_downloaded=True: {subtitle_true_updates['subtitle_downloaded']}, "
             + f"subtitle_downloaded=False: {subtitle_false_updates['subtitle_downloaded']}, "
             + f"zh-hk_downloaded=True: {subtitle_true_updates['zh-hk_downloaded']}, "
@@ -236,7 +290,7 @@ def scan_and_update_progress(
     else:
         print(
             "No updates needed. CSV file is already in sync with "
-            + "download and subtitle folders."
+            + "download, transcriptions, and subtitle folders."
         )
 
     if missing_audio_count:
@@ -251,6 +305,13 @@ def scan_and_update_progress(
             "Warning: Found "
             + f"{missing_subtitle_count['subtitle_downloaded']} rows marked 'subtitle_downloaded=True' in the CSV "
             + "but no yue-Hant/yue subtitle file in configured subtitle roots."
+        )
+        print(warning_message)
+
+    if missing_transcribed_count:
+        warning_message = (
+            f"Warning: Found {missing_transcribed_count} rows marked '{TRANSCRIBED_COLUMN}=True' in the CSV "
+            + "but no SRT file in the transcriptions folder."
         )
         print(warning_message)
 
