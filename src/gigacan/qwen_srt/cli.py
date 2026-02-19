@@ -58,10 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--super-batch-active-files",
         type=int,
-        default=0,
+        default=8,
         help=(
             "Number of files to keep active for cross-file segment super-batching "
-            "in batch mode. 0 = auto-tune (default)."
+            "in batch mode. Default: 8. Use 0 for auto-tune."
         ),
     )
     parser.add_argument(
@@ -76,19 +76,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--super-batch-preload-files",
         type=int,
-        default=0,
+        default=10,
         help=(
             "How many files to pre-load (VAD + decoded audio) ahead of GPU "
-            "processing in batch mode. 0 = auto-tune (default)."
+            "processing in batch mode. Default: 10. Use 0 for auto-tune."
         ),
     )
     parser.add_argument(
         "--super-batch-max-decoded-gib",
         type=float,
-        default=0.0,
+        default=6.0,
         help=(
             "Cap decoded-audio host RAM used by super-batching (GiB). "
-            "0 = auto-tune (default)."
+            "Default: 6.0. Use 0 for auto-tune."
         ),
     )
     parser.add_argument(
@@ -147,19 +147,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prep-workers",
         type=int,
-        default=0,
+        default=4,
         help=(
             "CPU workers for audio decoding prep in batch mode. "
-            "0 = auto-tune (default)."
+            "Default: 4. Use 0 for auto-tune."
         ),
     )
     parser.add_argument(
         "--vad-workers",
         type=int,
-        default=0,
+        default=1,
         help=(
             "Workers for VAD generation in batch mode. "
-            "0 = auto-tune (default)."
+            "Default: 1. Use 0 for auto-tune."
+        ),
+    )
+    parser.add_argument(
+        "--vad-device",
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help=(
+            'VAD execution device policy. "auto" (default) keeps current behavior '
+            '(CUDA when workers=1, CPU when workers>1 on CUDA ASR). '
+            '"cpu" forces CPU VAD. "cuda" forces GPU VAD.'
         ),
     )
     parser.add_argument(
@@ -219,10 +229,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--vllm-gpu-memory-utilization",
         type=float,
-        default=0.7,
+        default=0.9,
         help=(
             "vLLM-only: GPU memory utilization target passed to "
-            "Qwen3ASRModel.LLM. Default: 0.7."
+            "Qwen3ASRModel.LLM. Default: 0.9."
         ),
     )
     parser.add_argument(
@@ -333,6 +343,7 @@ def build_config(
         merge_max_gap_ms=namespace.merge_max_gap_ms,
         prep_workers=namespace.prep_workers,
         vad_workers=namespace.vad_workers,
+        vad_device=namespace.vad_device,
         asr_prefetch_batches=namespace.asr_prefetch_batches,
         qwen_src_dir=Path(namespace.qwen_src_dir),
         qwen_repo_url=namespace.qwen_repo_url,

@@ -130,10 +130,122 @@ If objective is **steady-state throughput** (long-running service / repeated run
 If objective is **total wall-clock for first full run**:
 
 - Use no-warmup cold-run strategy.
-- Current best tested setting:
+- Current best tested setting (still best after aggressive RAM/VRAM A/B):
   - `--asr-backend vllm`
   - `--prep-workers 4`
   - `--vad-workers 1`
   - `--super-batch-active-files 8`
   - `--super-batch-preload-files 10`
   - `--super-batch-max-decoded-gib 6`
+
+## Experiment D: RAM/VRAM headroom A/B on mixed full-folder subset (vLLM)
+
+Goal: verify whether using more host RAM + VRAM improves **total wall-clock**.
+
+Subset:
+
+- Source: full `download/` tree
+- Selection: deterministic random sample (`seed=20260218`) of `60` files
+- Path: `benchmarks/ab_subset_20260218_60/download`
+- Duration: `347,169s` (`~96.4358h`)
+
+Method:
+
+1. No warmup pass
+2. No persistent worker
+3. Fresh output dir and fresh VAD cache per case
+4. Runtime telemetry sampled every 2s (`nvidia-smi` + `/proc/meminfo`)
+
+Artifacts:
+
+- `benchmarks/ab_short_20260218_085205/results.json`
+- `benchmarks/ab_short_20260218_085205/A_baseline_current/run.log`
+- `benchmarks/ab_short_20260218_085205/B_aggressive_ram_gpu/run.log`
+
+Cases:
+
+- `A_baseline_current`:
+  - `--prep-workers 4`
+  - `--vad-workers 1`
+  - `--super-batch-active-files 8`
+  - `--super-batch-preload-files 10`
+  - `--super-batch-max-decoded-gib 6`
+  - `--asr-prefetch-batches 2`
+  - `--vllm-gpu-memory-utilization 0.70`
+- `B_aggressive_ram_gpu`:
+  - `--prep-workers 8`
+  - `--vad-workers 1`
+  - `--super-batch-active-files 12`
+  - `--super-batch-preload-files 16`
+  - `--super-batch-max-decoded-gib 12`
+  - `--asr-prefetch-batches 4`
+  - `--vllm-gpu-memory-utilization 0.85`
+
+Results:
+
+| Case | Wall time (s) | Realtime (x) | Avg GPU util | Avg VRAM (MiB) | Peak VRAM (MiB) | Avg RAM used (GiB) | Peak RAM used (GiB) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `A_baseline_current` | 715.70 | 485.08 | 66.8% | 25,550 | 29,929 | 14.97 | 18.45 |
+| `B_aggressive_ram_gpu` | 719.67 | 482.40 | 65.9% | 29,670 | 32,071 | 15.77 | 21.87 |
+
+- Speedup (`B / A` in throughput terms): **0.994x** (aggressive was ~0.6% slower)
+
+Observed effect:
+
+- We successfully increased memory usage:
+  - VRAM average +`4.1 GiB` (about `+16%`)
+  - Peak VRAM reached ~`32.1/32.6 GiB`
+  - Peak RAM used increased from `18.45` to `21.87 GiB`
+- But wall-clock did not improve; increased buffering/parallelism did not remove the dominant bottlenecks for this workload.
+
+Conclusion:
+
+- For first full-folder run, the baseline cold config remains the best tested choice.
+- More RAM/VRAM utilization alone does not guarantee lower end-to-end time in this pipeline.
+
+## Experiment E: Can `vad_workers > 1` on GPU speed up vLLM?
+
+Goal: test whether multi-worker GPU VAD increases end-to-end speed.
+
+Implementation note:
+
+- Added `--vad-device {auto,cpu,cuda}` so VAD device policy is explicit.
+- `auto` keeps existing behavior; `cuda` allows forcing GPU VAD even when `vad_workers > 1`.
+
+Dataset / method:
+
+- Dataset: `download/2013` (`~15.4041h`)
+- No warmup, no persistent worker
+- Common flags:
+  - `--asr-backend vllm`
+  - `--prep-workers 4`
+  - `--super-batch-active-files 8`
+  - `--super-batch-preload-files 10`
+  - `--super-batch-max-decoded-gib 6`
+  - `--asr-prefetch-batches 2`
+  - `--vllm-gpu-memory-utilization 0.7`
+- Fresh output + VAD cache per case
+
+Artifacts:
+
+- `benchmarks/vad_gpu_workers_20260218_095443/results.json`
+
+Results:
+
+| Case | Key VAD settings | Wall time (s) | Relative to best |
+|---|---|---:|---:|
+| `w1_gpu_auto` | `--vad-workers 1 --vad-device auto` (GPU VAD) | 180.03 | 1.000x |
+| `w4_cpu_auto` | `--vad-workers 4 --vad-device auto` (CPU VAD) | 192.02 | 0.938x |
+| `w4_gpu_forced` | `--vad-workers 4 --vad-device cuda` (GPU VAD) | 193.03 | 0.933x |
+
+Observed effect:
+
+- For this workload, `vad_workers > 1` did **not** improve speed.
+- Forcing multi-worker VAD onto GPU was slightly worse than both:
+  - baseline `w1_gpu_auto` (about `7.2%` slower),
+  - and `w4_cpu_auto` (about `0.5%` slower).
+
+Conclusion:
+
+- Keep `--vad-workers 1` as the default best setting.
+- Multi-worker GPU VAD is supported now (via `--vad-device cuda`) but not faster in tested conditions.

@@ -27,8 +27,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--merge-target-segment-ms", type=int, default=4000)
     parser.add_argument("--merge-max-segment-ms", type=int, default=12000)
     parser.add_argument("--merge-max-gap-ms", type=int, default=250)
-    parser.add_argument("--prep-workers", type=int, default=0)
-    parser.add_argument("--vad-workers", type=int, default=0)
+    parser.add_argument("--prep-workers", type=int, default=4)
+    parser.add_argument("--vad-workers", type=int, default=1)
+    parser.add_argument(
+        "--vad-device",
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+    )
     parser.add_argument("--asr-prefetch-batches", type=int, default=2)
     parser.add_argument("--qwen-src-dir", default=".cache/Qwen3-ASR-src")
     parser.add_argument(
@@ -49,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=["auto", "float32", "float16", "bfloat16"],
     )
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.7)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=256)
     parser.add_argument("--vad-cache-dir", default=".cache/qwen_srt_vad")
@@ -70,6 +75,7 @@ def _build_runtime_config(ns: argparse.Namespace) -> TranscribeConfig:
         merge_max_gap_ms=ns.merge_max_gap_ms,
         prep_workers=ns.prep_workers,
         vad_workers=ns.vad_workers,
+        vad_device=ns.vad_device,
         asr_prefetch_batches=ns.asr_prefetch_batches,
         qwen_src_dir=Path(ns.qwen_src_dir),
         qwen_repo_url=ns.qwen_repo_url,
@@ -122,6 +128,7 @@ def run_server(namespace: argparse.Namespace) -> None:
         "merge_max_gap_ms": config.merge_max_gap_ms,
         "prep_workers": config.prep_workers,
         "vad_workers": config.vad_workers,
+        "vad_device": config.vad_device,
         "asr_prefetch_batches": config.asr_prefetch_batches,
         "qwen_src_dir": str(config.qwen_src_dir),
         "qwen_repo_url": config.qwen_repo_url,

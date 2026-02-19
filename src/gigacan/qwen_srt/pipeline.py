@@ -143,6 +143,30 @@ def resolve_context_prompt(config: TranscribeConfig) -> tuple[str, bool]:
     return context_prompt, use_prompt
 
 
+def resolve_vad_device_policy(
+    *,
+    aux_device: str,
+    resolved_vad_workers: int,
+    vad_device_policy: str,
+) -> str:
+    policy = vad_device_policy.strip().lower()
+    if policy == "auto":
+        return (
+            "cpu"
+            if aux_device.startswith("cuda") and resolved_vad_workers > 1
+            else aux_device
+        )
+    if policy == "cpu":
+        return "cpu"
+    if policy == "cuda":
+        if not aux_device.startswith("cuda"):
+            raise RuntimeError(
+                f'--vad-device=cuda requires CUDA ASR device, got "{aux_device}".'
+            )
+        return aux_device
+    raise ValueError(f"Unsupported vad device policy: {vad_device_policy}")
+
+
 def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
     resolved_backend = config.asr_backend.strip().lower()
     if resolved_backend not in {"transformers", "vllm"}:
@@ -168,8 +192,10 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         if resolved_backend == "vllm" and resolved_device.startswith("cuda")
         else resolved_device
     )
-    vad_device = (
-        "cpu" if aux_device.startswith("cuda") and resolved_vad_workers > 1 else aux_device
+    vad_device = resolve_vad_device_policy(
+        aux_device=aux_device,
+        resolved_vad_workers=resolved_vad_workers,
+        vad_device_policy=config.vad_device,
     )
     context_prompt, use_prompt = resolve_context_prompt(config)
 

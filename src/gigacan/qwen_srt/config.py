@@ -23,8 +23,9 @@ class TranscribeConfig:
     merge_target_segment_ms: int = 4000
     merge_max_segment_ms: int = 12000
     merge_max_gap_ms: int = 250
-    prep_workers: int = 0
-    vad_workers: int = 0
+    prep_workers: int = 4
+    vad_workers: int = 1
+    vad_device: str = "auto"
     asr_prefetch_batches: int = 2
     qwen_src_dir: Path = Path(".cache/Qwen3-ASR-src")
     qwen_repo_url: str = "https://github.com/QwenLM/Qwen3-ASR"
@@ -33,7 +34,7 @@ class TranscribeConfig:
     qwen_context: str = DEFAULT_QWEN_CONTEXT_PROMPT
     use_prompt: bool = False
     qwen_dtype: str = "auto"
-    vllm_gpu_memory_utilization: float = 0.7
+    vllm_gpu_memory_utilization: float = 0.9
     vllm_tensor_parallel_size: int = 1
     qwen_max_new_tokens: int = 256
     vad_cache_dir: Path = Path(".cache/qwen_srt_vad")

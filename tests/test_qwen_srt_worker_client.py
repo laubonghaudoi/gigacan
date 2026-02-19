@@ -11,6 +11,7 @@ def _config() -> TranscribeConfig:
         audio=Path("a.opus"),
         output_srt=Path("a.srt"),
         asr_backend="vllm",
+        vad_device="cuda",
         vllm_gpu_memory_utilization=0.8,
         vllm_tensor_parallel_size=2,
     )
@@ -19,6 +20,7 @@ def _config() -> TranscribeConfig:
 def test_runtime_signature_includes_backend_fields() -> None:
     signature = _runtime_signature(_config())
     assert signature["asr_backend"] == "vllm"
+    assert signature["vad_device"] == "cuda"
     assert signature["vllm_gpu_memory_utilization"] == 0.8
     assert signature["vllm_tensor_parallel_size"] == 2
 
@@ -28,6 +30,8 @@ def test_worker_command_includes_backend_fields() -> None:
     assert "--asr-backend" in cmd
     asr_idx = cmd.index("--asr-backend")
     assert cmd[asr_idx + 1] == "vllm"
+    vad_dev_idx = cmd.index("--vad-device")
+    assert cmd[vad_dev_idx + 1] == "cuda"
 
     gpu_idx = cmd.index("--vllm-gpu-memory-utilization")
     tp_idx = cmd.index("--vllm-tensor-parallel-size")

@@ -10,8 +10,9 @@ from gigacan.qwen_srt.cli import build_config, parse_args
 def test_parse_args_defaults_to_vllm_backend() -> None:
     ns = parse_args([])
     assert ns.asr_backend == "vllm"
-    assert ns.vllm_gpu_memory_utilization == 0.7
+    assert ns.vllm_gpu_memory_utilization == 0.9
     assert ns.vllm_tensor_parallel_size == 1
+    assert ns.vad_device == "auto"
 
 
 def test_parse_args_rejects_invalid_vllm_tensor_parallel_size() -> None:
@@ -31,6 +32,8 @@ def test_build_config_maps_backend_fields() -> None:
         [
             "--asr-backend",
             "transformers",
+            "--vad-device",
+            "cuda",
             "--vllm-gpu-memory-utilization",
             "0.85",
             "--vllm-tensor-parallel-size",
@@ -39,5 +42,6 @@ def test_build_config_maps_backend_fields() -> None:
     )
     config = build_config(ns, audio=Path("a.opus"), output_srt=Path("a.srt"))
     assert config.asr_backend == "transformers"
+    assert config.vad_device == "cuda"
     assert config.vllm_gpu_memory_utilization == 0.85
     assert config.vllm_tensor_parallel_size == 2
