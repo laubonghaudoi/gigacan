@@ -85,6 +85,8 @@ class BatchBuildResult:
     batch_audio: list[tuple[Any, int]]
     batch_meta: list[SegmentTask]
     failures: list[tuple[SegmentTask, str]]
+    feats: Any | None = None
+    feat_lengths: Any | None = None
 
 
 @dataclass(slots=True)
@@ -183,6 +185,9 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         resolved_vad_workers=resolved_vad_workers,
         vad_device_policy=config.vad_device,
     )
+    import torch as _torch
+
+    saved_threads = _torch.get_num_threads()
     asr_model = build_asr_model(config, resolved_device, segment_batch_size)
 
     print(f"ASR backend: {resolved_backend}")
@@ -199,6 +204,12 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         config.vad_max_segment_ms,
         config.vad_max_end_silence_ms,
     )
+
+    # FunASR's AutoModel.__init__ calls torch.set_num_threads(4), clobbering
+    # the process-global thread count.  Restore it so our fbank pool and other
+    # torch CPU ops use all available cores.
+    if _torch.get_num_threads() != saved_threads:
+        _torch.set_num_threads(saved_threads)
     return PreparedTranscriber(
         asr_model=asr_model,
         vad_model=vad_model,
@@ -421,19 +432,18 @@ def resolve_per_file_enqueue(
     if current_feed_states < 0:
         raise ValueError("current_feed_states must be >= 0")
 
-    # Conservative baseline used previously.
+    # Conservative baseline: fair share when all files are active.
     baseline = max(1, segment_batch_size // (configured_active_files * 2))
-    # Adaptive target: when feed states shrink, raise contribution so batches stay full.
+    # Adaptive target: when feed states shrink, raise contribution so batches
+    # stay full.  With just 1 active file the entire batch should come from it.
     active_feeders = max(1, current_feed_states)
     adaptive = max(1, segment_batch_size // active_feeders)
-    # Safety cap prevents extreme tail bursts from overfilling huge batches and
-    # hurting end-to-end latency.
+    # Cap scales with how many feeders are active: many feeders -> tight cap to
+    # keep fairness; few feeders -> allow up to segment_batch_size so the GPU
+    # gets full-sized batches.
     cap = max(
         baseline,
-        min(
-            max(64, segment_batch_size // 4),
-            baseline * 8,
-        ),
+        max(64, segment_batch_size // max(1, active_feeders)),
     )
     return min(max(baseline, adaptive), cap)
 
@@ -638,6 +648,7 @@ def transcribe_batch_to_srt_superbatched(
     segment_queue: list[SegmentTask] = []
     decoded_budget_cv = Condition()
     decoded_bytes_accounted = 0
+    use_direct_inference: bool = getattr(runtime.asr_model, "_direct_ready", False)
 
     def reserve_decoded_budget(requested_bytes: int) -> int:
         nonlocal decoded_bytes_accounted
@@ -910,11 +921,13 @@ def transcribe_batch_to_srt_superbatched(
         if not feed_states or len(segment_queue) >= segment_queue_capacity:
             return
 
-        rounds = len(feed_states)
-        for _ in range(rounds):
-            if len(segment_queue) >= segment_queue_capacity:
-                break
-
+        # Target enough queued segments for the full prefetch depth so the GPU
+        # never stalls waiting for the next batch to be built.
+        target = min(
+            segment_queue_capacity,
+            runtime.segment_batch_size * resolved_prefetch_batches,
+        )
+        while feed_states and len(segment_queue) < target:
             state = feed_states.popleft()
             if state.failed or state.done:
                 continue
@@ -984,10 +997,24 @@ def transcribe_batch_to_srt_superbatched(
             batch_audio.append((segment_audio, state.audio_sr))
             batch_meta.append(task)
 
+        # Pre-compute fbank features so that GPU inference receives
+        # ready-to-go tensors instead of doing CPU extraction inline.
+        feats = None
+        feat_lengths = None
+        if batch_audio and use_direct_inference:
+            try:
+                waveforms = [samples for samples, _sr in batch_audio]
+                feats, feat_lengths = runtime.asr_model.extract_features(waveforms)
+            except Exception:  # noqa: BLE001
+                feats = None
+                feat_lengths = None
+
         return BatchBuildResult(
             batch_audio=batch_audio,
             batch_meta=batch_meta,
             failures=build_failures,
+            feats=feats,
+            feat_lengths=feat_lengths,
         )
 
     def execute_asr_batch(
@@ -1054,10 +1081,17 @@ def transcribe_batch_to_srt_superbatched(
             if not batch_audio:
                 return
 
-            batch_results = runtime.asr_model.transcribe(
-                audio=batch_audio,
-                language=runtime.asr_language,
-            )
+            if build_result.feats is not None:
+                batch_results = runtime.asr_model.transcribe_preprocessed(
+                    build_result.feats,
+                    build_result.feat_lengths,
+                    language=runtime.asr_language,
+                )
+            else:
+                batch_results = runtime.asr_model.transcribe(
+                    audio=batch_audio,
+                    language=runtime.asr_language,
+                )
             if len(batch_results) != len(batch_meta):
                 raise RuntimeError(
                     "ASR result size mismatch: "

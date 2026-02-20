@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
+import torchaudio.compliance.kaldi as kaldi
 from funasr import AutoModel
+from torch.nn.utils.rnn import pad_sequence
 
 from .config import TranscribeConfig
 
@@ -25,6 +30,38 @@ def resolve_segment_batch_size(device: str, batch_size_arg: int) -> int:
     return 4
 
 
+def _apply_lfr(inputs: torch.Tensor, lfr_m: int, lfr_n: int) -> torch.Tensor:
+    """Low Frame Rate: stack *lfr_m* frames, subsample by *lfr_n*."""
+    T = inputs.shape[0]
+    T_lfr = int(np.ceil(T / lfr_n))
+    left_padding = inputs[0].repeat((lfr_m - 1) // 2, 1)
+    inputs = torch.vstack((left_padding, inputs))
+    T = T + (lfr_m - 1) // 2
+    feat_dim = inputs.shape[-1]
+    strides = (lfr_n * feat_dim, 1)
+    sizes = (T_lfr, lfr_m * feat_dim)
+    last_idx = (T - lfr_m) // lfr_n + 1
+    num_padding = lfr_m - (T - last_idx * lfr_n)
+    if num_padding > 0:
+        num_padding = int(
+            (2 * lfr_m - 2 * T + (T_lfr - 1 + last_idx) * lfr_n)
+            / 2
+            * (T_lfr - last_idx)
+        )
+        inputs = torch.vstack([inputs] + [inputs[-1:]] * num_padding)
+    return inputs.as_strided(sizes, strides).clone().to(torch.float32)
+
+
+def _apply_cmvn(inputs: torch.Tensor, cmvn: torch.Tensor) -> torch.Tensor:
+    """Cepstral Mean and Variance Normalization."""
+    dim = inputs.shape[-1]
+    means = cmvn[0:1, :dim]
+    vars_data = cmvn[1:2, :dim]
+    inputs += means.to(inputs.device)
+    inputs *= vars_data.to(inputs.device)
+    return inputs.to(torch.float32)
+
+
 @dataclass(slots=True)
 class ASRResult:
     text: str
@@ -40,11 +77,206 @@ class SenseVoiceASRModel:
         default_language: str,
         use_itn: bool,
         max_inference_batch_size: int,
+        device: str = "cpu",
+        fbank_workers: int = 0,
     ) -> None:
         self.model = model
         self.default_language = default_language
         self.use_itn = use_itn
         self.max_inference_batch_size = max(1, int(max_inference_batch_size))
+        self.device = device
+
+        # Extract internal components for direct inference, bypassing AutoModel.
+        self._sensevoice = getattr(model, "model", None)
+        self._frontend = getattr(model, "kwargs", {}).get("frontend")
+        self._tokenizer = getattr(model, "kwargs", {}).get("tokenizer")
+
+        self._direct_ready = False
+        if self._frontend is not None and self._tokenizer is not None:
+            self._fbank_params = {
+                "num_mel_bins": self._frontend.n_mels,
+                "frame_length": self._frontend.frame_length,
+                "frame_shift": self._frontend.frame_shift,
+                "dither": self._frontend.dither,
+                "energy_floor": 0.0,
+                "window_type": self._frontend.window,
+                "sample_frequency": self._frontend.fs,
+                "snip_edges": self._frontend.snip_edges,
+            }
+            self._lfr_m: int = self._frontend.lfr_m
+            self._lfr_n: int = self._frontend.lfr_n
+            self._upscale: bool = getattr(self._frontend, "upsacle_samples", True)
+            self._cmvn: torch.Tensor | None = self._frontend.cmvn
+            self._blank_id: int = self._sensevoice.blank_id
+            self._lid_dict: dict[str, int] = self._sensevoice.lid_dict
+            self._textnorm_dict: dict[str, int] = self._sensevoice.textnorm_dict
+            self._direct_ready = True
+
+        resolved_workers = (
+            fbank_workers if fbank_workers > 0
+            else min(12, max(4, os.cpu_count() or 4))
+        )
+        self._fbank_pool = ThreadPoolExecutor(max_workers=resolved_workers)
+
+    def _extract_single_fbank(self, waveform: np.ndarray) -> torch.Tensor:
+        """Compute fbank + LFR + CMVN for one waveform segment.
+
+        This calls torchaudio C++ code that releases the GIL, so it can run in
+        parallel via ThreadPoolExecutor.
+        """
+        tensor = torch.from_numpy(waveform).to(torch.float32)
+        if self._upscale:
+            tensor = tensor * (1 << 15)
+        tensor = tensor.unsqueeze(0)
+
+        params = dict(self._fbank_params)
+        waveform_ms = tensor.shape[1] / params["sample_frequency"] * 1000
+        params["frame_length"] = min(params["frame_length"], waveform_ms)
+
+        mat = kaldi.fbank(tensor, **params)
+
+        if self._lfr_m != 1 or self._lfr_n != 1:
+            mat = _apply_lfr(mat, self._lfr_m, self._lfr_n)
+        if self._cmvn is not None:
+            mat = _apply_cmvn(mat, self._cmvn)
+
+        return mat
+
+    def extract_features(
+        self, waveforms: list[np.ndarray],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pre-compute fbank features for a batch of waveforms.
+
+        Uses a thread pool for parallelism since kaldi.fbank releases the GIL.
+        Returns (feats_pad, feats_lens) ready for ``transcribe_preprocessed``.
+        """
+        if not waveforms:
+            return torch.zeros(0, 0, 0), torch.zeros(0, dtype=torch.int32)
+
+        futures = [
+            self._fbank_pool.submit(self._extract_single_fbank, wf)
+            for wf in waveforms
+        ]
+        feats_list = [f.result() for f in futures]
+        feats_lens = torch.tensor(
+            [f.size(0) for f in feats_list], dtype=torch.int32,
+        )
+
+        if len(feats_list) == 1:
+            feats_pad = feats_list[0].unsqueeze(0)
+        else:
+            feats_pad = pad_sequence(
+                feats_list, batch_first=True, padding_value=0.0,
+            )
+
+        if self.device.startswith("cuda"):
+            feats_pad = feats_pad.pin_memory()
+
+        return feats_pad, feats_lens
+
+    def transcribe_preprocessed(
+        self,
+        feats: torch.Tensor,
+        feat_lengths: torch.Tensor,
+        *,
+        language: str = "",
+    ) -> list[ASRResult]:
+        """Run inference directly on pre-computed fbank features.
+
+        Bypasses AutoModel.inference() and its per-batch overheads
+        (random key generation, torch.cuda.empty_cache, etc.).
+        Automatically reduces chunk size on CUDA OOM.
+        """
+        B = feats.size(0)
+        if B == 0:
+            return []
+
+        results: list[ASRResult] = []
+        chunk_size = B
+        offset = 0
+
+        while offset < B:
+            end = min(offset + chunk_size, B)
+            try:
+                chunk_results = self._encode_and_decode(
+                    feats[offset:end],
+                    feat_lengths[offset:end],
+                    language=language,
+                )
+                results.extend(chunk_results)
+                offset = end
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if chunk_size <= 1:
+                    raise
+                chunk_size = max(1, chunk_size // 2)
+
+        return results
+
+    def _encode_and_decode(
+        self,
+        feats: torch.Tensor,
+        feat_lengths: torch.Tensor,
+        *,
+        language: str = "",
+    ) -> list[ASRResult]:
+        """Encode one chunk and CTC-decode the output."""
+        effective_language = language.strip() or self.default_language
+        sv = self._sensevoice
+        dev = self.device
+
+        speech = feats.to(device=dev, non_blocking=True)
+        speech_lengths = feat_lengths.to(device=dev, non_blocking=True)
+
+        lid = self._lid_dict.get(effective_language, 0)
+        language_query = sv.embed(
+            torch.LongTensor([[lid]]).to(dev)
+        ).expand(speech.size(0), -1, -1)
+
+        textnorm_key = "withitn" if self.use_itn else "woitn"
+        textnorm_query = sv.embed(
+            torch.LongTensor([[self._textnorm_dict[textnorm_key]]]).to(dev)
+        ).expand(speech.size(0), -1, -1)
+
+        speech = torch.cat((textnorm_query, speech), dim=1)
+        speech_lengths = speech_lengths + 1
+
+        event_emo_query = sv.embed(
+            torch.LongTensor([[1, 2]]).to(dev)
+        ).expand(speech.size(0), -1, -1)
+
+        input_query = torch.cat((language_query, event_emo_query), dim=1)
+        speech = torch.cat((input_query, speech), dim=1)
+        speech_lengths = speech_lengths + 3
+
+        with torch.no_grad():
+            encoder_out, encoder_out_lens = sv.encoder(speech, speech_lengths)
+            if isinstance(encoder_out, tuple):
+                encoder_out = encoder_out[0]
+
+            ctc_logits = sv.ctc.log_softmax(encoder_out)
+            all_preds = ctc_logits.argmax(dim=-1)
+
+        all_preds_cpu = all_preds.cpu()
+        encoder_out_lens_cpu = encoder_out_lens.cpu()
+
+        del speech, speech_lengths, encoder_out, encoder_out_lens
+        del ctc_logits, all_preds
+        if dev != "cpu":
+            torch.cuda.empty_cache()
+
+        tokenizer = self._tokenizer
+        blank_id = self._blank_id
+        results: list[ASRResult] = []
+        for i in range(all_preds_cpu.size(0)):
+            length = encoder_out_lens_cpu[i].item()
+            preds = all_preds_cpu[i, :length]
+            yseq = torch.unique_consecutive(preds)
+            token_int = yseq[yseq != blank_id].tolist()
+            text = tokenizer.decode(token_int)
+            results.append(ASRResult(text=text))
+
+        return results
 
     @staticmethod
     def _normalize_result_items(raw: Any) -> list[str]:
@@ -166,6 +398,7 @@ def build_asr_model_sensevoice(
                 default_language=config.asr_language,
                 use_itn=config.asr_use_itn,
                 max_inference_batch_size=segment_batch_size,
+                device=resolved_device,
             )
         except Exception as exc:  # noqa: BLE001
             last_error = exc

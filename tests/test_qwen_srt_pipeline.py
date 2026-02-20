@@ -119,7 +119,7 @@ def test_resolve_per_file_enqueue_scales_up_when_feeders_shrink() -> None:
     )
     assert full == 64
     assert tail > full
-    assert tail == 256
+    assert tail == 1024
 
 
 def test_resolve_decoded_audio_budget_bytes_honors_explicit_gib() -> None:
