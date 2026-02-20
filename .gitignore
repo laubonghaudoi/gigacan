@@ -27,3 +27,4 @@ logs/
 *.srt
 
 *.tar
+benchmarks/

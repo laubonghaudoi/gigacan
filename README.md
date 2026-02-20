@@ -36,6 +36,18 @@
 1. `vllm` 可調：`--vllm-gpu-memory-utilization`、`--vllm-tensor-parallel-size`
 1. `transformers` 可調：`--qwen-dtype`（`auto`=CUDA 用 `bfloat16`，CPU 用 `float32`）
 1. 單檔模式：`uv run transcribe --audio download/2026/J-ajS2LNnfs.opus --output-srt ./no_prompt.srt`
+1. 用 `zh-hk` 參考字幕修正 Qwen 轉寫（唔會用 `yue` 直接改字）：
+   ```bash
+   uv run 6_correct_transcriptions.py --year 2025
+   ```
+   如要改用 Ollama（例如 `gemma3:27b`）：
+   ```bash
+   uv run 6_correct_transcriptions.py --year 2025 --backend ollama --model gemma3:27b
+   ```
+   1. 修正後輸出：`corrected_transcriptions/<year>/*.srt`
+   1. 清單報表：`logs/correction_manifest_<year>.csv`
+   1. 匯總報告：`logs/correction_report_<year>.json`
+   1. `yue` 差異報告（只分析不改字）：`logs/yue_drift_report_<year>.csv`
 1. 針對影片類別修改 system  prompt，然後跑 `2_vtt.py`，會用 silero-vad 將輸入音頻分段再叫 qwen3-asr-flash 轉寫成粵文，生成 .vtt 字幕文件到 `vtt/`。
     1. 記得修改 `2_vtt.py` 入面嘅 prompt，會對字幕準確度有好大影響。
     1. 唔同題材需要設定唔同嘅`--vad-merge-ms`時長，例如張悦楷三國演義最優大概係 450，而毛澤東的黃昏歲月就最好係 500。推薦每加一個新題材之前用`tune_vad.ipynb`嚟確定最優值。
@@ -81,8 +93,8 @@
 1. **記憶體壓力治理**
    1. decode backlog 有上限，避免 decoded audio 無上限堆積。
    1. 新增 decoded audio RAM budget（`--super-batch-max-decoded-gib`，`0`=auto），producer 會按預算 backpressure。
-   1. 目前 full-run 穩定配置（RTX 5090 + 58GiB RAM 實測）：
-      `--prep-workers 4 --vad-workers 4 --super-batch-active-files 8 --super-batch-preload-files 10 --super-batch-max-decoded-gib 6`
+   1. 目前 full-run 預設配置（SenseVoice）：
+      `--segment-batch-size 1536 --prep-workers 20 --vad-workers 1 --super-batch-active-files 48 --super-batch-preload-files 96 --super-batch-queue-multiplier 48 --super-batch-max-decoded-gib 40 --asr-prefetch-batches 24 --vad-max-segment-ms 15000 --vad-max-end-silence-ms 500`
 1. **進度掃描整合**
    1. `legco.csv` 新增 `transcribed` 欄位。
    1. `2_scan_progress.py` 已同步掃描 `transcriptions/**/*.srt` 並更新 `transcribed`。

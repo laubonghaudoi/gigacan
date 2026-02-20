@@ -19,7 +19,6 @@ from .runtime import (
     build_asr_model,
     build_vad_model,
     resolve_device,
-    resolve_qwen_dtype,
     resolve_segment_batch_size,
 )
 from .srt import write_srt
@@ -38,6 +37,7 @@ class PreparedTranscriber:
     segment_batch_size: int
     min_segment_ms: int
     vad_max_segment_ms: int
+    vad_max_end_silence_ms: int
     merge_target_segment_ms: int
     merge_max_segment_ms: int
     merge_max_gap_ms: int
@@ -46,9 +46,7 @@ class PreparedTranscriber:
     asr_prefetch_batches: int
     vad_cache_dir: Path
     use_vad_cache: bool
-    qwen_language: str
-    context_prompt: str
-    use_prompt: bool
+    asr_language: str
 
 
 @dataclass(slots=True)
@@ -137,12 +135,6 @@ def estimate_feature_frames(duration_ms: int, frame_ms: int = 10) -> int:
     return max(1, (safe_duration_ms + safe_frame_ms - 1) // safe_frame_ms)
 
 
-def resolve_context_prompt(config: TranscribeConfig) -> tuple[str, bool]:
-    use_prompt = config.use_prompt and bool(config.qwen_context.strip())
-    context_prompt = config.qwen_context if use_prompt else ""
-    return context_prompt, use_prompt
-
-
 def resolve_vad_device_policy(
     *,
     aux_device: str,
@@ -169,15 +161,14 @@ def resolve_vad_device_policy(
 
 def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
     resolved_backend = config.asr_backend.strip().lower()
-    if resolved_backend not in {"transformers", "vllm"}:
+    if resolved_backend == "vllm":
+        raise RuntimeError(
+            "SenseVoice does not support the vLLM backend. "
+            "Use --asr-backend sensevoice or --asr-backend transformers."
+        )
+    if resolved_backend not in {"sensevoice", "transformers"}:
         raise ValueError(f"Unsupported ASR backend: {config.asr_backend}")
     resolved_device = resolve_device(config.device)
-    if resolved_backend == "vllm" and not resolved_device.startswith("cuda"):
-        raise RuntimeError(
-            f"vLLM backend requires CUDA, got resolved device {resolved_device!r}. "
-            "Use --asr-backend transformers on CPU."
-        )
-    qwen_dtype = resolve_qwen_dtype(config.qwen_dtype, resolved_device)
     segment_batch_size = resolve_segment_batch_size(
         resolved_device,
         config.segment_batch_size,
@@ -187,35 +178,27 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         if config.vad_workers > 0
         else (4 if resolved_device.startswith("cuda") else 2)
     )
-    aux_device = (
-        "cuda:0"
-        if resolved_backend == "vllm" and resolved_device.startswith("cuda")
-        else resolved_device
-    )
     vad_device = resolve_vad_device_policy(
-        aux_device=aux_device,
+        aux_device=resolved_device,
         resolved_vad_workers=resolved_vad_workers,
         vad_device_policy=config.vad_device,
     )
-    context_prompt, use_prompt = resolve_context_prompt(config)
-
-    asr_model = build_asr_model(config, resolved_device, qwen_dtype, segment_batch_size)
+    asr_model = build_asr_model(config, resolved_device, segment_batch_size)
 
     print(f"ASR backend: {resolved_backend}")
+    print(f"ASR model: {config.asr_model} ({config.asr_model_hub})")
     print(f"Using device: {resolved_device}")
     print(f"Using VAD device: {vad_device}")
-    if resolved_backend == "transformers":
-        print(f"Qwen dtype: {qwen_dtype}")
-    else:
-        print(
-            "vLLM settings: "
-            f"gpu_memory_utilization={config.vllm_gpu_memory_utilization}, "
-            f"tensor_parallel_size={config.vllm_tensor_parallel_size}"
-        )
+    print(f"ASR language: {config.asr_language}")
+    print(f"ASR ITN: {'enabled' if config.asr_use_itn else 'disabled'}")
+    print(f"VAD max end silence: {config.vad_max_end_silence_ms} ms")
     print(f"Segment batch size: {segment_batch_size}")
-    print(f"Qwen context prompt: {'enabled' if use_prompt else 'disabled'}")
 
-    vad_model = build_vad_model(vad_device, config.vad_max_segment_ms)
+    vad_model = build_vad_model(
+        vad_device,
+        config.vad_max_segment_ms,
+        config.vad_max_end_silence_ms,
+    )
     return PreparedTranscriber(
         asr_model=asr_model,
         vad_model=vad_model,
@@ -225,6 +208,7 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         segment_batch_size=segment_batch_size,
         min_segment_ms=config.min_segment_ms,
         vad_max_segment_ms=config.vad_max_segment_ms,
+        vad_max_end_silence_ms=config.vad_max_end_silence_ms,
         merge_target_segment_ms=config.merge_target_segment_ms,
         merge_max_segment_ms=config.merge_max_segment_ms,
         merge_max_gap_ms=config.merge_max_gap_ms,
@@ -233,9 +217,7 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         asr_prefetch_batches=config.asr_prefetch_batches,
         vad_cache_dir=config.vad_cache_dir,
         use_vad_cache=config.use_vad_cache,
-        qwen_language=config.qwen_language,
-        context_prompt=context_prompt,
-        use_prompt=use_prompt,
+        asr_language=config.asr_language,
     )
 
 
@@ -252,6 +234,7 @@ def collect_vad_segments(
             audio,
             min_segment_ms=runtime.min_segment_ms,
             vad_max_segment_ms=runtime.vad_max_segment_ms,
+            vad_max_end_silence_ms=runtime.vad_max_end_silence_ms,
         )
         if cached is not None:
             base_segments = cached
@@ -273,6 +256,7 @@ def collect_vad_segments(
                 audio,
                 min_segment_ms=runtime.min_segment_ms,
                 vad_max_segment_ms=runtime.vad_max_segment_ms,
+                vad_max_end_silence_ms=runtime.vad_max_end_silence_ms,
                 segments=base_segments,
             )
 
@@ -419,6 +403,41 @@ def resolve_segment_queue_capacity(
     return max(segment_batch_size, segment_batch_size * queue_multiplier)
 
 
+def resolve_per_file_enqueue(
+    *,
+    segment_batch_size: int,
+    configured_active_files: int,
+    current_feed_states: int,
+) -> int:
+    """Adapt per-file queue contribution to keep ASR batches dense.
+
+    We keep fairness when many files are active, but allow aggressive fill when
+    the pipeline tails down to just a few remaining files.
+    """
+    if segment_batch_size < 1:
+        raise ValueError("segment_batch_size must be >= 1")
+    if configured_active_files < 1:
+        raise ValueError("configured_active_files must be >= 1")
+    if current_feed_states < 0:
+        raise ValueError("current_feed_states must be >= 0")
+
+    # Conservative baseline used previously.
+    baseline = max(1, segment_batch_size // (configured_active_files * 2))
+    # Adaptive target: when feed states shrink, raise contribution so batches stay full.
+    active_feeders = max(1, current_feed_states)
+    adaptive = max(1, segment_batch_size // active_feeders)
+    # Safety cap prevents extreme tail bursts from overfilling huge batches and
+    # hurting end-to-end latency.
+    cap = max(
+        baseline,
+        min(
+            max(64, segment_batch_size // 4),
+            baseline * 8,
+        ),
+    )
+    return min(max(baseline, adaptive), cap)
+
+
 def resolve_frame_budget(
     segment_queue: list[SegmentTask],
     batch_size: int,
@@ -531,8 +550,7 @@ def transcribe_audio_to_srt(
 
         results = runtime.asr_model.transcribe(
             audio=batch_audio,
-            context=runtime.context_prompt,
-            language=runtime.qwen_language,
+            language=runtime.asr_language,
         )
         if len(results) != len(batch_segments):
             raise RuntimeError(
@@ -590,8 +608,11 @@ def transcribe_batch_to_srt_superbatched(
         runtime.segment_batch_size,
         queue_multiplier,
     )
-    # Keep enough per-file contribution so the queue fills quickly.
-    per_file_enqueue = max(1, runtime.segment_batch_size // (resolved_active_files * 2))
+    default_per_file_enqueue = resolve_per_file_enqueue(
+        segment_batch_size=runtime.segment_batch_size,
+        configured_active_files=resolved_active_files,
+        current_feed_states=resolved_active_files,
+    )
 
     print(
         "Super-batch settings: "
@@ -604,7 +625,7 @@ def transcribe_batch_to_srt_superbatched(
         f"decoded_budget_gib={decoded_budget_bytes / BYTES_PER_GIB:.2f}, "
         f"prefetch_batches={resolved_prefetch_batches}, "
         f"segment_queue={segment_queue_capacity}, "
-        f"per_file_enqueue={per_file_enqueue}"
+        f"per_file_enqueue_default={default_per_file_enqueue}"
     )
 
     ordered_jobs = sort_jobs_by_duration(jobs)
@@ -716,7 +737,11 @@ def transcribe_batch_to_srt_superbatched(
                 return collect_vad_segments(runtime, job.audio)
             worker_model = getattr(vad_local, "model", None)
             if worker_model is None:
-                worker_model = build_vad_model(vad_worker_device, runtime.vad_max_segment_ms)
+                worker_model = build_vad_model(
+                    vad_worker_device,
+                    runtime.vad_max_segment_ms,
+                    runtime.vad_max_end_silence_ms,
+                )
                 setattr(vad_local, "model", worker_model)
             return collect_vad_segments(runtime, job.audio, vad_model=worker_model)
 
@@ -898,6 +923,11 @@ def transcribe_batch_to_srt_superbatched(
                 continue
 
             remaining = len(state.segments) - state.next_segment_idx
+            per_file_enqueue = resolve_per_file_enqueue(
+                segment_batch_size=runtime.segment_batch_size,
+                configured_active_files=resolved_active_files,
+                current_feed_states=len(feed_states) + 1,
+            )
             budget = min(
                 per_file_enqueue,
                 remaining,
@@ -989,8 +1019,7 @@ def transcribe_batch_to_srt_superbatched(
             try:
                 subset_results = runtime.asr_model.transcribe(
                     audio=subset_audio,
-                    context=runtime.context_prompt,
-                    language=runtime.qwen_language,
+                    language=runtime.asr_language,
                 )
                 if len(subset_results) != len(subset_meta):
                     raise RuntimeError(
@@ -1027,8 +1056,7 @@ def transcribe_batch_to_srt_superbatched(
 
             batch_results = runtime.asr_model.transcribe(
                 audio=batch_audio,
-                context=runtime.context_prompt,
-                language=runtime.qwen_language,
+                language=runtime.asr_language,
             )
             if len(batch_results) != len(batch_meta):
                 raise RuntimeError(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entrypoint for local SenseVoice transcription to SRT."""
+"""CLI entrypoint for zh-HK-guided subtitle correction and yue drift reporting."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from gigacan.qwen_srt.cli import main  # noqa: E402
+from gigacan.subtitle_correction.cli import main  # noqa: E402
 
 
 if __name__ == "__main__":

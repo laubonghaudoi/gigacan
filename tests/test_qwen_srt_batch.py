@@ -1,112 +1,197 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
-from gigacan.qwen_srt.batch import (
-    build_batch_jobs,
-    discover_audio_files,
-    filter_audio_files_by_year,
-    output_srt_for_audio,
-    sort_jobs_by_duration,
-    BatchJob,
-)
+from gigacan.qwen_srt import batch
+from gigacan.qwen_srt.batch import BatchJob, sort_jobs_by_duration
 
 
-def test_discover_audio_files_filters_and_sorts(tmp_path: Path) -> None:
-    root = tmp_path / "download"
-    (root / "2025").mkdir(parents=True)
-    (root / "2024").mkdir(parents=True)
-    (root / "2025" / "b.opus").write_text("", encoding="utf-8")
-    (root / "2024" / "a.mp3").write_text("", encoding="utf-8")
-    (root / "2025" / "note.txt").write_text("not audio", encoding="utf-8")
-
-    files = discover_audio_files(root)
-
-    assert files == [root / "2024" / "a.mp3", root / "2025" / "b.opus"]
+def _touch(path: Path, size_bytes: int = 1) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x" * size_bytes)
 
 
-def test_output_srt_for_audio_mirrors_directory_structure(tmp_path: Path) -> None:
-    audio_root = tmp_path / "download"
-    output_root = tmp_path / "transcriptions"
-    audio = audio_root / "2025" / "xyz.opus"
-    audio.parent.mkdir(parents=True)
-    audio.write_text("", encoding="utf-8")
-
-    output_srt = output_srt_for_audio(audio, audio_root, output_root)
-
-    assert output_srt == output_root / "2025" / "xyz.srt"
+def _write_metadata_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    fieldnames = ["id", "audio", "duration", "duration_seconds", "url"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
-def test_build_batch_jobs_skips_existing_when_not_overwrite(tmp_path: Path) -> None:
-    audio_root = tmp_path / "download"
-    output_root = tmp_path / "transcriptions"
-    audio_a = audio_root / "2025" / "a.opus"
-    audio_b = audio_root / "2025" / "b.opus"
-    audio_a.parent.mkdir(parents=True)
-    audio_a.write_text("", encoding="utf-8")
-    audio_b.write_text("", encoding="utf-8")
-    existing = output_root / "2025" / "a.srt"
-    existing.parent.mkdir(parents=True)
-    existing.write_text("", encoding="utf-8")
-
-    jobs, skipped = build_batch_jobs(
-        [audio_a, audio_b],
-        audio_root,
-        output_root,
-        overwrite=False,
-    )
-
-    assert skipped == 1
-    assert [job.audio for job in jobs] == [audio_b]
-    assert [job.output_srt for job in jobs] == [output_root / "2025" / "b.srt"]
+def _write_legco_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    fieldnames = [
+        "url",
+        "title",
+        "description",
+        "publish_date",
+        "duration",
+        "downloaded",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
-def test_filter_audio_files_by_year_matches_first_path_component(tmp_path: Path) -> None:
-    audio_root = tmp_path / "download"
-    a2024 = audio_root / "2024" / "a.opus"
-    a2025 = audio_root / "2025" / "b.opus"
-    nested2025 = audio_root / "2025" / "nested" / "c.opus"
-    for path in [a2024, a2025, nested2025]:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-
-    filtered = filter_audio_files_by_year(
-        [a2024, a2025, nested2025],
-        audio_root,
-        "2025",
-    )
-
-    assert filtered == [a2025, nested2025]
-
-
-def test_sort_jobs_by_duration_interleaves_long_and_short_jobs(
-    tmp_path: Path, monkeypatch
+def test_sort_jobs_by_duration_uses_metadata_hints_without_ffprobe(
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
-    root = tmp_path / "download" / "2025"
-    root.mkdir(parents=True)
-    short = root / "short.opus"
-    mid = root / "mid.opus"
-    long = root / "long.opus"
-    for audio in [short, mid, long]:
-        audio.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _touch(Path("download/2025/a.opus"), size_bytes=10)
+    _touch(Path("download/2025/b.opus"), size_bytes=10)
+    _touch(Path("download/2025/c.opus"), size_bytes=10)
+
+    _write_metadata_csv(
+        Path("metadata.csv"),
+        [
+            {
+                "id": "a",
+                "audio": "download/2025/a.opus",
+                "duration": "00:01:40",
+                "duration_seconds": "100",
+                "url": "https://example.com/a",
+            },
+            {
+                "id": "b",
+                "audio": "download/2025/b.opus",
+                "duration": "00:00:10",
+                "duration_seconds": "10",
+                "url": "https://example.com/b",
+            },
+            {
+                "id": "c",
+                "audio": "download/2025/c.opus",
+                "duration": "00:01:10",
+                "duration_seconds": "70",
+                "url": "https://example.com/c",
+            },
+        ],
+    )
+
+    def fail_probe(_audio: Path) -> float:
+        raise AssertionError("ffprobe should not be used when metadata covers all jobs")
+
+    monkeypatch.setattr(batch, "probe_audio_duration_seconds", fail_probe)
 
     jobs = [
-        BatchJob(audio=short, output_srt=short.with_suffix(".srt")),
-        BatchJob(audio=mid, output_srt=mid.with_suffix(".srt")),
-        BatchJob(audio=long, output_srt=long.with_suffix(".srt")),
+        BatchJob(audio=Path("download/2025/a.opus"), output_srt=Path("out/a.srt")),
+        BatchJob(audio=Path("download/2025/b.opus"), output_srt=Path("out/b.srt")),
+        BatchJob(audio=Path("download/2025/c.opus"), output_srt=Path("out/c.srt")),
     ]
+    ordered = sort_jobs_by_duration(jobs)
+    assert [job.audio.name for job in ordered] == ["a.opus", "b.opus", "c.opus"]
 
-    durations = {
-        short: 10.0,
-        mid: 20.0,
-        long: 30.0,
-    }
 
-    monkeypatch.setattr(
-        "gigacan.qwen_srt.batch.probe_audio_duration_seconds",
-        lambda audio: durations[audio],
+def test_sort_jobs_by_duration_uses_legco_duration_hints_without_ffprobe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _touch(Path("download/2025/a.opus"), size_bytes=10)
+    _touch(Path("download/2025/b.opus"), size_bytes=10)
+    _touch(Path("download/2025/c.opus"), size_bytes=10)
+
+    _write_legco_csv(
+        Path("legco.csv"),
+        [
+            {
+                "url": "https://www.youtube.com/watch?v=a",
+                "title": "A",
+                "description": "",
+                "publish_date": "2025-01-01",
+                "duration": "00:01:40",
+                "downloaded": "True",
+            },
+            {
+                "url": "https://www.youtube.com/watch?v=b",
+                "title": "B",
+                "description": "",
+                "publish_date": "2025-01-01",
+                "duration": "00:00:10",
+                "downloaded": "True",
+            },
+            {
+                "url": "https://www.youtube.com/watch?v=c",
+                "title": "C",
+                "description": "",
+                "publish_date": "2025-01-01",
+                "duration": "00:01:10",
+                "downloaded": "True",
+            },
+        ],
     )
 
-    ordered = sort_jobs_by_duration(jobs)
+    def fail_probe(_audio: Path) -> float:
+        raise AssertionError("ffprobe should not be used when legco.csv covers all jobs")
 
-    assert [job.audio for job in ordered] == [long, short, mid]
+    monkeypatch.setattr(batch, "probe_audio_duration_seconds", fail_probe)
+
+    jobs = [
+        BatchJob(audio=Path("download/2025/a.opus"), output_srt=Path("out/a.srt")),
+        BatchJob(audio=Path("download/2025/b.opus"), output_srt=Path("out/b.srt")),
+        BatchJob(audio=Path("download/2025/c.opus"), output_srt=Path("out/c.srt")),
+    ]
+    ordered = sort_jobs_by_duration(jobs)
+    assert [job.audio.name for job in ordered] == ["a.opus", "b.opus", "c.opus"]
+
+
+def test_sort_jobs_by_duration_falls_back_to_ffprobe_for_small_missing_set(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _touch(Path("download/a.opus"), size_bytes=100)
+    _touch(Path("download/b.opus"), size_bytes=100)
+    _touch(Path("download/c.opus"), size_bytes=100)
+
+    calls: list[str] = []
+    duration_by_name = {
+        "a.opus": 100.0,
+        "b.opus": 10.0,
+        "c.opus": 70.0,
+    }
+
+    def fake_probe(audio: Path) -> float:
+        calls.append(audio.name)
+        return duration_by_name[audio.name]
+
+    monkeypatch.setattr(batch, "probe_audio_duration_seconds", fake_probe)
+    monkeypatch.setattr(batch, "MAX_FFPROBE_FALLBACK_JOBS", 10)
+
+    jobs = [
+        BatchJob(audio=Path("download/a.opus"), output_srt=Path("out/a.srt")),
+        BatchJob(audio=Path("download/b.opus"), output_srt=Path("out/b.srt")),
+        BatchJob(audio=Path("download/c.opus"), output_srt=Path("out/c.srt")),
+    ]
+    ordered = sort_jobs_by_duration(jobs)
+    assert sorted(calls) == ["a.opus", "b.opus", "c.opus"]
+    assert [job.audio.name for job in ordered] == ["a.opus", "b.opus", "c.opus"]
+
+
+def test_sort_jobs_by_duration_uses_filesize_estimate_when_missing_set_is_large(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _touch(Path("download/a.opus"), size_bytes=8_000)
+    _touch(Path("download/b.opus"), size_bytes=1_000)
+    _touch(Path("download/c.opus"), size_bytes=5_000)
+
+    def fail_probe(_audio: Path) -> float:
+        raise AssertionError("ffprobe should be skipped for large unresolved sets")
+
+    monkeypatch.setattr(batch, "probe_audio_duration_seconds", fail_probe)
+    monkeypatch.setattr(batch, "MAX_FFPROBE_FALLBACK_JOBS", 2)
+
+    jobs = [
+        BatchJob(audio=Path("download/a.opus"), output_srt=Path("out/a.srt")),
+        BatchJob(audio=Path("download/b.opus"), output_srt=Path("out/b.srt")),
+        BatchJob(audio=Path("download/c.opus"), output_srt=Path("out/c.srt")),
+    ]
+    ordered = sort_jobs_by_duration(jobs)
+    assert [job.audio.name for job in ordered] == ["a.opus", "b.opus", "c.opus"]

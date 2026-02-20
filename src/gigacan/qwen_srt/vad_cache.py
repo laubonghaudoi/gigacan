@@ -20,6 +20,7 @@ def load_vad_cache(
     *,
     min_segment_ms: int,
     vad_max_segment_ms: int,
+    vad_max_end_silence_ms: int,
 ) -> list[tuple[int, int]] | None:
     path = _cache_path(cache_dir, audio_path)
     if not path.is_file():
@@ -43,6 +44,8 @@ def load_vad_cache(
         return None
     if payload.get("vad_max_segment_ms") != int(vad_max_segment_ms):
         return None
+    if payload.get("vad_max_end_silence_ms") != int(vad_max_end_silence_ms):
+        return None
 
     raw = payload.get("segments", [])
     segments: list[tuple[int, int]] = []
@@ -59,6 +62,7 @@ def save_vad_cache(
     *,
     min_segment_ms: int,
     vad_max_segment_ms: int,
+    vad_max_end_silence_ms: int,
     segments: list[tuple[int, int]],
 ) -> None:
     try:
@@ -73,6 +77,7 @@ def save_vad_cache(
         "mtime_ns": int(stat.st_mtime_ns),
         "min_segment_ms": int(min_segment_ms),
         "vad_max_segment_ms": int(vad_max_segment_ms),
+        "vad_max_end_silence_ms": int(vad_max_end_silence_ms),
         "segments": [[int(start), int(end)] for start, end in segments],
     }
     path = _cache_path(cache_dir, audio_path)

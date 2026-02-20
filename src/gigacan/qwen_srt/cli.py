@@ -7,14 +7,26 @@ from pathlib import Path
 from tqdm import tqdm
 
 from .batch import build_batch_jobs, discover_audio_files, filter_audio_files_by_year
-from .config import DEFAULT_QWEN_CONTEXT_PROMPT, TranscribeConfig
+from .config import (
+    DEFAULT_ASR_LANGUAGE,
+    DEFAULT_ASR_PREFETCH_BATCHES,
+    DEFAULT_ASR_MODEL,
+    DEFAULT_PREP_WORKERS,
+    DEFAULT_SEGMENT_BATCH_SIZE,
+    DEFAULT_SUPER_BATCH_ACTIVE_FILES,
+    DEFAULT_SUPER_BATCH_MAX_DECODED_GIB,
+    DEFAULT_SUPER_BATCH_PRELOAD_FILES,
+    DEFAULT_SUPER_BATCH_QUEUE_MULTIPLIER,
+    DEFAULT_VAD_WORKERS,
+    TranscribeConfig,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Transcribe one audio file or all audio files under a directory "
-            "with Qwen3-ASR-1.7B and output SRT."
+            "with SenseVoice and output SRT."
         )
     )
     parser.add_argument(
@@ -58,37 +70,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--super-batch-active-files",
         type=int,
-        default=8,
+        default=DEFAULT_SUPER_BATCH_ACTIVE_FILES,
         help=(
             "Number of files to keep active for cross-file segment super-batching "
-            "in batch mode. Default: 8. Use 0 for auto-tune."
+            f"in batch mode. Default: {DEFAULT_SUPER_BATCH_ACTIVE_FILES}. "
+            "Use 0 for auto-tune."
         ),
     )
     parser.add_argument(
         "--super-batch-queue-multiplier",
         type=int,
-        default=4,
+        default=DEFAULT_SUPER_BATCH_QUEUE_MULTIPLIER,
         help=(
             "Multiplier for super-batch segment queue capacity relative to "
-            "--segment-batch-size. Default: 4."
+            "--segment-batch-size. "
+            f"Default: {DEFAULT_SUPER_BATCH_QUEUE_MULTIPLIER}."
         ),
     )
     parser.add_argument(
         "--super-batch-preload-files",
         type=int,
-        default=10,
+        default=DEFAULT_SUPER_BATCH_PRELOAD_FILES,
         help=(
             "How many files to pre-load (VAD + decoded audio) ahead of GPU "
-            "processing in batch mode. Default: 10. Use 0 for auto-tune."
+            "processing in batch mode. "
+            f"Default: {DEFAULT_SUPER_BATCH_PRELOAD_FILES}. "
+            "Use 0 for auto-tune."
         ),
     )
     parser.add_argument(
         "--super-batch-max-decoded-gib",
         type=float,
-        default=6.0,
+        default=DEFAULT_SUPER_BATCH_MAX_DECODED_GIB,
         help=(
             "Cap decoded-audio host RAM used by super-batching (GiB). "
-            "Default: 6.0. Use 0 for auto-tune."
+            f"Default: {DEFAULT_SUPER_BATCH_MAX_DECODED_GIB:.1f}. "
+            "Use 0 for auto-tune."
         ),
     )
     parser.add_argument(
@@ -99,10 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--segment-batch-size",
         type=int,
-        default=0,
+        default=DEFAULT_SEGMENT_BATCH_SIZE,
         help=(
             "ASR batch size for VAD segments. "
-            "0 = auto (GPU:128, CPU:4)."
+            f"Default: {DEFAULT_SEGMENT_BATCH_SIZE}."
         ),
     )
     parser.add_argument(
@@ -114,8 +131,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--vad-max-segment-ms",
         type=int,
-        default=20000,
-        help="Maximum VAD segment duration in ms. Default: 20000 (20s).",
+        default=15000,
+        help="Maximum VAD segment duration in ms. Default: 15000 (15s).",
+    )
+    parser.add_argument(
+        "--vad-max-end-silence-ms",
+        type=int,
+        default=500,
+        help=(
+            "VAD end-of-speech silence timeout in ms. "
+            "Lower values end segments sooner. Default: 500."
+        ),
     )
     parser.add_argument(
         "--merge-target-segment-ms",
@@ -147,19 +173,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prep-workers",
         type=int,
-        default=4,
+        default=DEFAULT_PREP_WORKERS,
         help=(
             "CPU workers for audio decoding prep in batch mode. "
-            "Default: 4. Use 0 for auto-tune."
+            f"Default: {DEFAULT_PREP_WORKERS}. Use 0 for auto-tune."
         ),
     )
     parser.add_argument(
         "--vad-workers",
         type=int,
-        default=1,
+        default=DEFAULT_VAD_WORKERS,
         help=(
             "Workers for VAD generation in batch mode. "
-            "Default: 1. Use 0 for auto-tune."
+            f"Default: {DEFAULT_VAD_WORKERS}. Use 0 for auto-tune."
         ),
     )
     parser.add_argument(
@@ -175,74 +201,56 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--asr-prefetch-batches",
         type=int,
-        default=2,
+        default=DEFAULT_ASR_PREFETCH_BATCHES,
         help=(
             "Number of ASR batches to pre-build ahead of inference "
-            "for async request feeding. Must be >=1. Default: 2."
+            "for async request feeding. Must be >=1. "
+            f"Default: {DEFAULT_ASR_PREFETCH_BATCHES}."
         ),
     )
     parser.add_argument(
-        "--qwen-src-dir",
-        default=".cache/Qwen3-ASR-src",
-        help='Path to Qwen3-ASR source code. Auto-cloned if missing. Default: ".cache/Qwen3-ASR-src".',
+        "--asr-model",
+        default=DEFAULT_ASR_MODEL,
+        help=(
+            "SenseVoice model id or local path. "
+            f'Default: "{DEFAULT_ASR_MODEL}".'
+        ),
     )
     parser.add_argument(
-        "--qwen-repo-url",
-        default="https://github.com/QwenLM/Qwen3-ASR",
-        help="Git URL used when auto-cloning Qwen3-ASR source.",
-    )
-    parser.add_argument(
-        "--qwen-model",
-        default="Qwen/Qwen3-ASR-1.7B",
-        help='Hugging Face model id or local path. Default: "Qwen/Qwen3-ASR-1.7B".',
+        "--asr-model-hub",
+        default="auto",
+        choices=["auto", "ms", "hf"],
+        help='Model hub selection: "auto" (default), "ms", or "hf".',
     )
     parser.add_argument(
         "--asr-backend",
-        default="vllm",
-        choices=["vllm", "transformers"],
-        help='ASR backend: "vllm" (default) or "transformers".',
+        default="sensevoice",
+        choices=["sensevoice", "transformers", "vllm"],
+        help=(
+            'ASR backend: "sensevoice" (default) or "transformers" (alias). '
+            '"vllm" is rejected because SenseVoice has no vLLM backend.'
+        ),
     )
     parser.add_argument(
-        "--qwen-language",
-        default="Cantonese",
-        help='Forced language for Qwen ASR. Default: "Cantonese".',
+        "--asr-language",
+        default=DEFAULT_ASR_LANGUAGE,
+        help=(
+            "SenseVoice language code. "
+            f'Default: "{DEFAULT_ASR_LANGUAGE}".'
+        ),
     )
     parser.add_argument(
-        "--qwen-context",
-        default=DEFAULT_QWEN_CONTEXT_PROMPT,
-        help="Context prompt passed to Qwen3-ASR for each segment. Edit the placeholder default in this script or override with this argument.",
-    )
-    parser.add_argument(
-        "--use-prompt",
+        "--asr-use-itn",
+        dest="asr_use_itn",
         action="store_true",
-        help="Enable context prompt in decoding. Default: disabled (no prompt).",
+        default=True,
+        help="Enable inverse text normalization in SenseVoice decoding. Default: enabled.",
     )
     parser.add_argument(
-        "--qwen-dtype",
-        default="auto",
-        choices=["auto", "float32", "float16", "bfloat16"],
-        help=(
-            'Model dtype for transformers backend. '
-            '"auto" uses bfloat16 on CUDA and float32 on CPU.'
-        ),
-    )
-    parser.add_argument(
-        "--vllm-gpu-memory-utilization",
-        type=float,
-        default=0.9,
-        help=(
-            "vLLM-only: GPU memory utilization target passed to "
-            "Qwen3ASRModel.LLM. Default: 0.9."
-        ),
-    )
-    parser.add_argument(
-        "--vllm-tensor-parallel-size",
-        type=int,
-        default=1,
-        help=(
-            "vLLM-only: tensor parallel size passed to Qwen3ASRModel.LLM. "
-            "Default: 1."
-        ),
+        "--no-asr-use-itn",
+        dest="asr_use_itn",
+        action="store_false",
+        help="Disable inverse text normalization in SenseVoice decoding.",
     )
     parser.add_argument(
         "--vad-cache-dir",
@@ -272,12 +280,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Send shutdown command to the persistent worker and exit.",
     )
-    parser.add_argument(
-        "--qwen-max-new-tokens",
-        type=int,
-        default=256,
-        help="Maximum generated tokens per segment batch.",
-    )
+
+    # Compatibility aliases for previous Qwen-specific flags.
+    parser.add_argument("--qwen-model", dest="asr_model", help=argparse.SUPPRESS)
+    parser.add_argument("--qwen-language", dest="asr_language", help=argparse.SUPPRESS)
+    parser.add_argument("--qwen-src-dir", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--qwen-repo-url", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--qwen-context", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--use-prompt", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--qwen-dtype", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--qwen-max-new-tokens", type=int, default=0, help=argparse.SUPPRESS)
     return parser
 
 
@@ -302,6 +316,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--merge-max-segment-ms must be >= 1.")
     if namespace.merge_max_gap_ms < 0:
         parser.error("--merge-max-gap-ms must be >= 0.")
+    if namespace.vad_max_end_silence_ms < 0:
+        parser.error("--vad-max-end-silence-ms must be >= 0.")
     if (
         namespace.merge_target_segment_ms > 0
         and namespace.merge_max_segment_ms < namespace.merge_target_segment_ms
@@ -315,13 +331,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--vad-workers must be >= 0.")
     if namespace.asr_prefetch_batches < 1:
         parser.error("--asr-prefetch-batches must be >= 1.")
-    if namespace.vllm_tensor_parallel_size < 1:
-        parser.error("--vllm-tensor-parallel-size must be >= 1.")
-    if (
-        namespace.vllm_gpu_memory_utilization <= 0.0
-        or namespace.vllm_gpu_memory_utilization > 1.0
-    ):
-        parser.error("--vllm-gpu-memory-utilization must be in (0, 1].")
+    if namespace.asr_backend == "vllm":
+        parser.error(
+            "--asr-backend=vllm is unsupported for SenseVoice. "
+            "Use --asr-backend sensevoice or --asr-backend transformers."
+        )
+    if not namespace.asr_model.strip():
+        parser.error("--asr-model must be non-empty.")
     return namespace
 
 
@@ -331,13 +347,22 @@ def build_config(
     audio: Path,
     output_srt: Path,
 ) -> TranscribeConfig:
+    backend = namespace.asr_backend
+    if backend == "transformers":
+        backend = "sensevoice"
     return TranscribeConfig(
         audio=audio,
         output_srt=output_srt,
+        asr_backend=backend,
+        asr_model=namespace.asr_model,
+        asr_model_hub=namespace.asr_model_hub,
+        asr_language=namespace.asr_language,
+        asr_use_itn=namespace.asr_use_itn,
         device=namespace.device,
         segment_batch_size=namespace.segment_batch_size,
         min_segment_ms=namespace.min_segment_ms,
         vad_max_segment_ms=namespace.vad_max_segment_ms,
+        vad_max_end_silence_ms=namespace.vad_max_end_silence_ms,
         merge_target_segment_ms=namespace.merge_target_segment_ms,
         merge_max_segment_ms=namespace.merge_max_segment_ms,
         merge_max_gap_ms=namespace.merge_max_gap_ms,
@@ -345,17 +370,6 @@ def build_config(
         vad_workers=namespace.vad_workers,
         vad_device=namespace.vad_device,
         asr_prefetch_batches=namespace.asr_prefetch_batches,
-        qwen_src_dir=Path(namespace.qwen_src_dir),
-        qwen_repo_url=namespace.qwen_repo_url,
-        qwen_model=namespace.qwen_model,
-        asr_backend=namespace.asr_backend,
-        qwen_language=namespace.qwen_language,
-        qwen_context=namespace.qwen_context,
-        use_prompt=namespace.use_prompt,
-        qwen_dtype=namespace.qwen_dtype,
-        vllm_gpu_memory_utilization=namespace.vllm_gpu_memory_utilization,
-        vllm_tensor_parallel_size=namespace.vllm_tensor_parallel_size,
-        qwen_max_new_tokens=namespace.qwen_max_new_tokens,
         vad_cache_dir=Path(namespace.vad_cache_dir),
         use_vad_cache=not namespace.no_vad_cache,
     )
@@ -448,6 +462,7 @@ def run_batch(namespace: argparse.Namespace) -> None:
         desc="Transcribing",
         dynamic_ncols=True,
     ) as progress:
+
         def on_done(audio_path: Path) -> None:
             progress.set_postfix_str(to_relative(audio_path))
             progress.update(1)

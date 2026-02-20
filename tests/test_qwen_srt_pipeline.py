@@ -12,6 +12,7 @@ from gigacan.qwen_srt.pipeline import (
     estimate_feature_frames,
     merge_small_vad_segments,
     resolve_decoded_audio_budget_bytes,
+    resolve_per_file_enqueue,
     select_frame_aware_batch,
 )
 
@@ -101,6 +102,24 @@ def test_select_frame_aware_batch_enforces_batch_size_limit() -> None:
 def test_estimate_decoded_audio_bytes_has_overhead() -> None:
     one_second = estimate_decoded_audio_bytes(1000)
     assert one_second > 16_000 * 4
+
+
+def test_resolve_per_file_enqueue_scales_up_when_feeders_shrink() -> None:
+    # Full active set: keep fair contribution.
+    full = resolve_per_file_enqueue(
+        segment_batch_size=1024,
+        configured_active_files=16,
+        current_feed_states=16,
+    )
+    # Tail phase with one feeder: push aggressively to keep batches dense.
+    tail = resolve_per_file_enqueue(
+        segment_batch_size=1024,
+        configured_active_files=16,
+        current_feed_states=1,
+    )
+    assert full == 64
+    assert tail > full
+    assert tail == 256
 
 
 def test_resolve_decoded_audio_budget_bytes_honors_explicit_gib() -> None:
