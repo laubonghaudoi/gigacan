@@ -9,11 +9,17 @@ from typing import Any
 
 from .batch import BatchJob
 from .config import (
+    DEFAULT_ASR_ENGINE,
     DEFAULT_ASR_LANGUAGE,
     DEFAULT_ASR_MODEL,
     DEFAULT_ASR_PREFETCH_BATCHES,
     DEFAULT_PREP_WORKERS,
+    DEFAULT_QWEN_CONTEXT_PROMPT,
+    DEFAULT_QWEN_LANGUAGE,
+    DEFAULT_QWEN_MODEL,
     DEFAULT_SEGMENT_BATCH_SIZE,
+    DEFAULT_VAD_MAX_END_SILENCE_MS,
+    DEFAULT_VAD_MAX_SEGMENT_MS,
     DEFAULT_VAD_WORKERS,
     TranscribeConfig,
 )
@@ -26,13 +32,22 @@ def _send_json(writer: Any, payload: dict[str, Any]) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Persistent SenseVoice SRT worker daemon")
+    parser = argparse.ArgumentParser(description="Persistent Qwen/SenseVoice SRT worker daemon")
     parser.add_argument("--socket", required=True, help="UNIX socket path")
+    parser.add_argument(
+        "--asr-engine",
+        default=DEFAULT_ASR_ENGINE,
+        choices=["qwen3", "sensevoice"],
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--segment-batch-size", type=int, default=DEFAULT_SEGMENT_BATCH_SIZE)
     parser.add_argument("--min-segment-ms", type=int, default=300)
-    parser.add_argument("--vad-max-segment-ms", type=int, default=15000)
-    parser.add_argument("--vad-max-end-silence-ms", type=int, default=500)
+    parser.add_argument("--vad-max-segment-ms", type=int, default=DEFAULT_VAD_MAX_SEGMENT_MS)
+    parser.add_argument(
+        "--vad-max-end-silence-ms",
+        type=int,
+        default=DEFAULT_VAD_MAX_END_SILENCE_MS,
+    )
     parser.add_argument("--merge-target-segment-ms", type=int, default=4000)
     parser.add_argument("--merge-max-segment-ms", type=int, default=12000)
     parser.add_argument("--merge-max-gap-ms", type=int, default=250)
@@ -44,16 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "cpu", "cuda"],
     )
     parser.add_argument("--asr-prefetch-batches", type=int, default=DEFAULT_ASR_PREFETCH_BATCHES)
-    parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL)
     parser.add_argument(
         "--asr-model-hub",
         default="auto",
         choices=["auto", "ms", "hf"],
-    )
-    parser.add_argument(
-        "--asr-backend",
-        default="sensevoice",
-        choices=["sensevoice", "transformers"],
     )
     parser.add_argument("--asr-language", default=DEFAULT_ASR_LANGUAGE)
     parser.add_argument(
@@ -67,18 +76,25 @@ def build_parser() -> argparse.ArgumentParser:
         dest="asr_use_itn",
         action="store_false",
     )
+    parser.add_argument("--qwen-src-dir", default=".cache/Qwen3-ASR-src")
+    parser.add_argument("--qwen-repo-url", default="https://github.com/QwenLM/Qwen3-ASR")
+    parser.add_argument("--qwen-language", default=DEFAULT_QWEN_LANGUAGE)
+    parser.add_argument("--qwen-context", default=DEFAULT_QWEN_CONTEXT_PROMPT)
+    parser.add_argument("--use-prompt", action="store_true")
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--qwen-max-new-tokens", type=int, default=256)
     parser.add_argument("--vad-cache-dir", default=".cache/qwen_srt_vad")
     parser.add_argument("--no-vad-cache", action="store_true")
     return parser
 
 
 def _build_runtime_config(ns: argparse.Namespace) -> TranscribeConfig:
-    backend = ns.asr_backend
-    if backend == "transformers":
-        backend = "sensevoice"
+    engine = ns.asr_engine.strip().lower()
     return TranscribeConfig(
         audio=Path("__worker_placeholder__.wav"),
         output_srt=Path("__worker_placeholder__.srt"),
+        asr_engine=engine,
         device=ns.device,
         segment_batch_size=ns.segment_batch_size,
         min_segment_ms=ns.min_segment_ms,
@@ -91,11 +107,19 @@ def _build_runtime_config(ns: argparse.Namespace) -> TranscribeConfig:
         vad_workers=ns.vad_workers,
         vad_device=ns.vad_device,
         asr_prefetch_batches=ns.asr_prefetch_batches,
-        asr_backend=backend,
-        asr_model=ns.asr_model,
+        asr_model=DEFAULT_ASR_MODEL,
         asr_model_hub=ns.asr_model_hub,
         asr_language=ns.asr_language,
         asr_use_itn=ns.asr_use_itn,
+        qwen_src_dir=Path(ns.qwen_src_dir),
+        qwen_repo_url=ns.qwen_repo_url,
+        qwen_model=DEFAULT_QWEN_MODEL,
+        qwen_language=ns.qwen_language,
+        qwen_context=ns.qwen_context,
+        use_prompt=ns.use_prompt,
+        vllm_gpu_memory_utilization=ns.vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=ns.vllm_tensor_parallel_size,
+        qwen_max_new_tokens=ns.qwen_max_new_tokens,
         vad_cache_dir=Path(ns.vad_cache_dir),
         use_vad_cache=not ns.no_vad_cache,
     )
@@ -139,11 +163,20 @@ def run_server(namespace: argparse.Namespace) -> None:
         "vad_workers": config.vad_workers,
         "vad_device": config.vad_device,
         "asr_prefetch_batches": config.asr_prefetch_batches,
-        "asr_backend": config.asr_backend,
+        "asr_engine": config.asr_engine,
         "asr_model": config.asr_model,
         "asr_model_hub": config.asr_model_hub,
         "asr_language": config.asr_language,
         "asr_use_itn": config.asr_use_itn,
+        "qwen_src_dir": str(config.qwen_src_dir),
+        "qwen_repo_url": config.qwen_repo_url,
+        "qwen_model": config.qwen_model,
+        "qwen_language": config.qwen_language,
+        "qwen_context": config.qwen_context,
+        "use_prompt": config.use_prompt,
+        "vllm_gpu_memory_utilization": config.vllm_gpu_memory_utilization,
+        "vllm_tensor_parallel_size": config.vllm_tensor_parallel_size,
+        "qwen_max_new_tokens": config.qwen_max_new_tokens,
         "vad_cache_dir": str(config.vad_cache_dir),
         "use_vad_cache": config.use_vad_cache,
     }

@@ -1,5 +1,5 @@
 import re
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 
 class RuleBasedCorrector:
@@ -17,6 +17,7 @@ class RuleBasedCorrector:
                 (re.compile(r"俾(?!(?:路支|斯麥|益))"), r"畀"),
                 (re.compile(r"(?<!(?:聯關))[系繫](?!(?:統))"), r"係"),
                 (re.compile(r"噶"), r"㗎"),
+                (re.compile(r"咧"), r"呢"),
                 (re.compile(r"姥爺"), r"老爺"),
                 (re.compile(r"咁(?=[我你佢就樣就話係啊呀嘅，。])"), r"噉"),
                 (re.compile(r"(?<![曝晾])曬(?:[衣太衫褲被命嘢相])"), r"晒"),
@@ -34,7 +35,9 @@ class RuleBasedCorrector:
             out = pat.sub(repl, out)
         return out
 
-    def correct_entries(self, entries: List[Tuple[float, float, str]]) -> List[Tuple[float, float, str]]:
+    def correct_entries(
+        self, entries: List[Tuple[float, float, str]]
+    ) -> List[Tuple[float, float, str]]:
         """Return a new entries list with corrected cue text.
 
         entries: List of (start_seconds, end_seconds, text)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entrypoint for local SenseVoice transcription to SRT."""
+"""CLI entrypoint for local Qwen3/SenseVoice transcription to SRT."""
 
 from __future__ import annotations
 

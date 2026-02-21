@@ -122,6 +122,31 @@ def test_resolve_per_file_enqueue_scales_up_when_feeders_shrink() -> None:
     assert tail == 1024
 
 
+def test_finalize_state_sorts_entries_by_timestamp(tmp_path) -> None:
+    out_srt = tmp_path / "out.srt"
+    state = FileBatchState(
+        job=BatchJob(audio=Path("dummy.opus"), output_srt=out_srt),
+        segments=[],
+    )
+    state.entries = [
+        (15_000, 16_000, "third"),
+        (5_000, 6_000, "first"),
+        (10_000, 11_000, "second"),
+    ]
+    state.entries.sort()
+
+    from gigacan.qwen_srt.srt import write_srt
+
+    write_srt(out_srt, state.entries)
+    lines = out_srt.read_text().strip().splitlines()
+    timestamps = [l for l in lines if "-->" in l]
+    assert timestamps == [
+        "00:00:05,000 --> 00:00:06,000",
+        "00:00:10,000 --> 00:00:11,000",
+        "00:00:15,000 --> 00:00:16,000",
+    ]
+
+
 def test_resolve_decoded_audio_budget_bytes_honors_explicit_gib() -> None:
     runtime = SimpleNamespace(device="cuda:0")
     budget = resolve_decoded_audio_budget_bytes(runtime, 3.5)

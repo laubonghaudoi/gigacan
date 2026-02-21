@@ -1,251 +1,186 @@
-# Qwen3-ASR Transcription Optimization Log
+# Transcription Pipeline Optimization Log
 
-This file records optimization strategies we tried, how we measured them, and the resulting speed impact.
+This file records optimization strategies, benchmarks, and resulting performance for the Qwen3-ASR + vLLM transcription pipeline.
 
-## Dataset and metric
+## Hardware
 
-- Benchmark dataset: `download/2013`
-- Audio duration: `55,454.81s` (`~15.4041h`)
-- Primary metric: end-to-end wall time (seconds)
-- Secondary metric: realtime factor (`audio_seconds / wall_seconds`)
+- GPU: NVIDIA GeForce RTX 5090 (32 GB VRAM)
+- CPU: AMD Ryzen 9 9950X3D (16 cores / 32 threads)
+- RAM: 58 GiB
 
-## Optimizations implemented in pipeline
+## Production dataset
 
-These are already in code and affect both backends unless noted:
+- 14,033 audio files (LegCo proceedings), 948 GB total
+- File size: 0.1–494 MB (median 71 MB, mean 68 MB)
+- Audio duration: ~24,700 hours total (median ~1.76 h per file)
 
-1. Cross-file super-batching (`global segment queue`)
-2. Frame-aware batch selection (reduce padding waste)
-3. ASR payload prefetch (`--asr-prefetch-batches`)
-4. Parallel decode prep + VAD workers (`--prep-workers`, `--vad-workers`)
-5. VAD segment cache (`--vad-cache-dir`, enabled by default)
-6. Segment merge controls (`merge-target/max/gap`)
-7. Decoded-audio RAM budget backpressure (`--super-batch-max-decoded-gib`)
-8. Duration-aware file interleaving (`sort_jobs_by_duration`)
-9. Binary-split fallback on ASR batch errors
-10. Optional persistent worker (warm-run/steady-state benchmark mode)
+## Current optimal defaults
 
-Backend-specific:
+```
+DEFAULT_SEGMENT_BATCH_SIZE       = 1536
+DEFAULT_SUPER_BATCH_ACTIVE_FILES = 48
+DEFAULT_SUPER_BATCH_QUEUE_MULTIPLIER = 48
+DEFAULT_SUPER_BATCH_PRELOAD_FILES = 96
+DEFAULT_SUPER_BATCH_MAX_DECODED_GIB = 25.0
+DEFAULT_PREP_WORKERS             = 24
+DEFAULT_VAD_WORKERS              = 24
+DEFAULT_ASR_PREFETCH_BATCHES     = 6
+DEFAULT_VAD_MAX_SEGMENT_MS       = 20000
+DEFAULT_VAD_MAX_END_SILENCE_MS   = 300
+VAD pre-computation workers      = 8   (multiprocessing, auto-capped)
+ffmpeg decode threads             = 1   (per subprocess, -threads 1)
+use_vad_cache                     = True
+```
 
-1. `vllm`: `Qwen3ASRModel.LLM(...)`, `--vllm-gpu-memory-utilization`, `--vllm-tensor-parallel-size`
-2. `transformers`: `--qwen-dtype auto` (`bfloat16` on CUDA)
+### Qwen3 vLLM-specific defaults
 
-## Experiment A: Warm-run throughput (persistent worker)
+```
+DEFAULT_VLLM_MAX_MODEL_LEN      = 4096
+DEFAULT_VLLM_MAX_NUM_SEQS       = 256
+vllm_gpu_memory_utilization      = 0.9
+disable_log_stats                = True
+enable_prefix_caching            = True   (vLLM v0.14 default)
+```
 
-Method:
+## Two-phase pipeline architecture (2026-02-20)
 
-1. Warmup pass (not timed)
-2. Timed pass with same persistent worker
+The pipeline runs in two sequential phases to maximize both CPU and GPU utilization:
 
-Common flags:
+### Phase 1 — VAD pre-computation (CPU-bound, multiprocessing)
 
-- `--prep-workers 4`
-- `--vad-workers 4`
-- `--super-batch-active-files 8`
-- `--super-batch-preload-files 10`
-- `--super-batch-max-decoded-gib 6`
+- Uses `multiprocessing.Pool` with 8 workers (spawn context, each with own GIL)
+- Each worker: ffmpeg decode (1-thread subprocess) → streaming chunked VAD → save to cache
+- Memory-efficient: ~38 MB peak per worker regardless of file length (no audio accumulation)
+- Shortest-first file ordering maximizes cache fill rate (6–14 files/s on small files, ~0.3 files/s on large files)
+- CPU utilization: **75–98%** (all cores active)
+- GPU: idle (expected, VAD is CPU-only)
 
-Results (`benchmarks/time_2013_*_20260218_072910.txt`):
+### Phase 2 — ASR transcription (GPU-bound, threaded)
 
-| Backend | Wall time (s) | Realtime (x) |
-|---|---:|---:|
-| `vllm` | 96.35 | 575.56 |
-| `transformers` | 337.42 | 164.35 |
+- Producer threads load cached VAD (instant) + ffmpeg decode (subprocess, GIL-free)
+- Consumer feeds GPU with pre-computed segment batches via cross-file super-batching
+- GPU utilization: **35–96%** (avg ~71%) during ASR inference
+- CPU: 56–92% (parallel ffmpeg decode + batch preparation)
 
-- Speedup (`transformers / vllm`): **3.50x**
-- Report: `benchmarks/benchmark_2013_20260218_072910.md`
+### E2E benchmark (2026-02-20)
 
-## Experiment B: Cold single-pass tuning for total wall-clock (vLLM)
+9 representative files spanning P05–P99 (833 MB total, ~20 h audio):
 
-Goal: optimize *first full run* time (no warmup flow).
+| Phase | Duration | CPU | GPU |
+| ----- | -------: | --: | --: |
+| VAD pre-computation | 56 s | 21–80% | 0% |
+| ASR transcription | 63 s | 56–92% | 35–96% (avg 71%) |
+| **Total** | **119 s** | — | — |
 
-Method:
+### Estimated production run (14,033 files, ~24,700 h audio)
 
-1. No warmup pass
-2. Fresh output dir + fresh VAD cache per case
-3. Same `download/2013` dataset
+- Phase 1 (VAD): ~4–5 hours
+- Phase 2 (ASR): ~22 hours
+- **Total: ~27 hours** (vs ~14 days with the original threaded pipeline = **~13× speedup**)
 
-Results (`benchmarks/cold_tune_20260218_075512/time_*.txt`):
+## Optimizations implemented
 
-| Case | Key settings | Wall time (s) | Realtime (x) |
-|---|---|---:|---:|
-| `gpu_vad_w1` | `--vad-workers 1`, `--prep-workers 4`, active/preload `8/10`, RAM `6GiB` | 182.04 | 304.63 |
-| `cpu_vad_w4` | `--vad-workers 4`, `--prep-workers 4`, active/preload `8/10`, RAM `6GiB` | 200.47 | 276.62 |
-| `cpu_vad_w4_push` | `--vad-workers 4`, `--prep-workers 6`, active/preload `10/12`, RAM `8GiB` | 213.57 | 259.66 |
+### Architectural (in code)
 
-Observed effect:
+1. **Cross-file super-batching** — global segment queue mixes segments from multiple active files into each ASR batch.
+2. **Frame-aware batch selection** — sliding-window algorithm picks segments with similar frame counts to reduce padding waste.
+3. **ASR payload prefetch** — background thread pool pre-builds batches (including fbank extraction) while the GPU processes the current batch.
+4. **Multiprocessing VAD pre-computation** — `multiprocessing.Pool` (8 workers, spawn context) runs FSMN-VAD in separate processes to bypass the GIL. Each worker streams ffmpeg output through chunked VAD without accumulating audio in memory. Results are saved to the VAD cache so the main pipeline only needs ffmpeg decode (subprocess, GIL-free).
+5. **VAD segment cache** — caches VAD results per file (`.cache/qwen_srt_vad/`) to skip recomputation on subsequent or interrupted runs.
+6. **Segment merge controls** — adjacent short VAD segments are merged up to configurable target/max/gap thresholds.
+7. **Decoded-audio RAM budget backpressure** — caps host RAM for decoded audio at 25 GiB, preventing OOM on large batches of files.
+8. **Duration-aware file interleaving** — `sort_jobs_by_duration` alternates long and short files to smooth CPU/RAM pressure during the ASR phase.
+9. **Binary-split fallback on ASR batch errors** — if a batch fails, binary split isolates the problematic segment(s).
 
-- `gpu_vad_w1` was best in this cold-run matrix.
-- Improvement vs `cpu_vad_w4`: **1.10x**
-- Improvement vs `cpu_vad_w4_push`: **1.17x**
+### Qwen3 vLLM fast wrapper (2026-02-20)
 
-## Experiment C: Cold no-warmup backend baseline (apples-to-apples)
+10. **Reduced `max_model_len` (65536 → 4096)** — default vLLM context window was 65k tokens, but ASR sequences are only ~300–500 tokens. This limited KV cache concurrency to 2.95×. With `max_model_len=4096`, concurrency increases to 47.2×.
+11. **Increased `max_num_seqs` (default → 256)** — allows up to 256 concurrent sequences in the vLLM scheduler, matching the many-short-request pattern of ASR transcription.
+12. **`Qwen3VLLMFastWrapper` bypass** — wraps upstream `Qwen3ASRModel` to skip redundant `normalize_audios()`, `split_audio_into_chunks()`, and cache the prompt template. Directly constructs vLLM input dicts and calls `model.generate()`.
+13. **`disable_log_stats=True`** — removes per-batch stats logging overhead in the vLLM engine.
 
-Goal: measure true first-run backend speed gap.
+### OOM fixes (2026-02-20)
 
-Method:
+14. **Switched audio loading from torchaudio to ffmpeg** — `torchaudio.load()` created ~14 GB intermediate buffers for a 10-hour file before downsampling. `ffmpeg` decodes directly to 16 kHz mono float32, reducing peak per-file memory from ~25 GB to ~3.5 GB.
+15. **Combined decode+VAD into a single worker** — eliminated redundant audio loading by FunASR's VAD model (which internally re-loaded each file at the original sample rate).
+16. **Fixed decoded-budget deadlock** — replaced blocking `reserve_decoded_budget()` with non-blocking `try_reserve_decoded_budget()` that alternates with `drain_jobs(block=True)`.
 
-1. No warmup
-2. No persistent worker
-3. Same flags for both backends:
-   - `--prep-workers 4`
-   - `--vad-workers 1`
-   - `--super-batch-active-files 8`
-   - `--super-batch-preload-files 10`
-   - `--super-batch-max-decoded-gib 6`
+### GIL bottleneck fix (2026-02-20)
 
-Results:
+The critical production bottleneck: `ThreadPoolExecutor` workers share a single GIL. FunASR's `model.generate()` holds the GIL during Python-level preprocessing, and FSMN-VAD is too lightweight for PyTorch tensor ops to dominate. Result: only 1 VAD ran at a time despite 24 workers, leaving GPU at 0% for 95%+ of the time and only 1–2 CPU cores active.
 
-| Backend | Artifact | Wall time (s) | Realtime (x) |
-|---|---|---:|---:|
-| `transformers` | `benchmarks/baseline_2013_transformers_cold_20260218_081323.time` | 397.34 | 139.57 |
-| `vllm` | `benchmarks/baseline_2013_vllm_cold_nopw_20260218_082014.time` | 179.85 | 308.34 |
+17. **Multiprocessing VAD pre-computation** — `precompute_vad_multiprocessing()` uses `multiprocessing.Pool` (spawn context) so each worker has its own GIL. True parallelism achieved.
+18. **Memory-efficient `compute_vad_streaming()`** — streams ffmpeg output through chunked VAD without accumulating decoded audio. Peak RAM per worker ≈ 38 MB regardless of file length.
+19. **Shortest-first file ordering** — VAD pre-computation sorts files by size ascending. Small files complete immediately, filling the cache fast and keeping all workers busy.
+20. **`ffmpeg -threads 1`** — limits each ffmpeg subprocess to 1 codec thread. Without this, each ffmpeg spawned ~17 internal threads; with 24 workers that meant 408 threads on 32 logical CPUs.
+21. **`torch.set_num_threads(1)` in workers** — FSMN-VAD does not benefit from multi-threading (measured: identical speed at 1 vs 4 threads). Setting to 1 eliminates cross-worker contention.
 
-- Speedup (`transformers / vllm`): **2.21x**
+## Benchmark results
 
-Notes:
+### Qwen3 vLLM tuning (2026-02-20)
 
-- `benchmarks/baseline_2013_transformers_cold_20260218_081133.time` is invalid (interrupted run; `0s`) and excluded.
+Benchmark on `download/2013/` (14 files, 15.4 h audio), RTX 5090, cold start:
 
-## What warmup actually does (and does not do)
+| Config | Wall time (s) | Speedup | Concurrency | GPU util |
+| ------ | ------------: | ------: | ----------: | -------: |
+| Baseline (mml=65536, no bypass) | 155.8 | 1.00× | 2.95× | 26.7% |
+| max_model_len=4096 | 113.7 | 1.37× | 47.2× | 33.4% |
+| bypass + mml=4096 (optimal) | **89.0** | **1.75×** | 47.2× | 43.4% |
 
-Warmup run is a full pass, not a lightweight precompute step:
+### VAD multiprocessing worker count (2026-02-20)
 
-1. Loads ASR runtime/model
-2. Performs VAD + decode + ASR + SRT writing
-3. Populates VAD cache for subsequent runs
+Benchmark on 30 median-sized files (~70 MB each), with `ffmpeg -threads 1`:
 
-Clarification:
+| Workers | Rate (files/s) | Est 14K (h) |
+| ------: | -------------: | ----------: |
+|       1 |           0.14 |        26.9 |
+|       4 |           0.27 |        14.4 |
+|       8 |           0.27 |        14.5 |
+|      12 |           0.28 |        14.0 |
+|      16 |           0.27 |        14.5 |
 
-- It is **not** “CPU+GPU VAD precompute together.”
-- VAD device is chosen by runtime logic:
-  - with `--vad-workers > 1` on CUDA, VAD usually runs on CPU
-  - with `--vad-workers 1`, VAD runs on ASR device (CUDA here)
+4–16 workers plateau at ~0.27 files/s on median files. 8 is the default (safe middle ground).
 
-## Current best config choice by objective
+### GPU VAD vs CPU multiprocessing VAD (2026-02-20)
 
-If objective is **steady-state throughput** (long-running service / repeated runs):
+Benchmark on 9 representative production files (P05–P99, 833 MB, ~20 h audio):
 
-- Use persistent worker warm-run workflow (`vllm`), which gave `96.35s` on 2013 set.
+| Approach | VAD time | Total time | Throughput |
+| -------- | -------: | ---------: | ---------: |
+| GPU VAD (cuda:0, 1 process) | 47.5 s | 70.6 s | 0.13 files/s |
+| CPU VAD (1 process) | 68.4 s | 91.4 s | 0.10 files/s |
+| **CPU VAD (8 multiprocessing workers)** | parallel | ~110 s | **0.27 files/s** |
 
-If objective is **total wall-clock for first full run**:
+GPU is 1.44× faster per-file, but CPU wins on **total throughput** (2.1×) because it scales across 8 parallel processes. With a single GPU also needed for ASR inference (28 GB VRAM occupied by vLLM), multiprocessing CPU VAD is the better choice.
 
-- Use no-warmup cold-run strategy.
-- Current best tested setting (still best after aggressive RAM/VRAM A/B):
-  - `--asr-backend vllm`
-  - `--prep-workers 4`
-  - `--vad-workers 1`
-  - `--super-batch-active-files 8`
-  - `--super-batch-preload-files 10`
-  - `--super-batch-max-decoded-gib 6`
+### Per-file decode+VAD profiling (2026-02-20)
 
-## Experiment D: RAM/VRAM headroom A/B on mixed full-folder subset (vLLM)
+Single-process streaming decode+VAD times by file size percentile:
 
-Goal: verify whether using more host RAM + VRAM improves **total wall-clock**.
+| Percentile | File size | Decode | VAD | Streaming | Segments | Audio |
+| ---------: | --------: | -----: | --: | --------: | -------: | ----: |
+|        P05 |    1.8 MB |  0.1 s | 0.2 s |     0.2 s |       95 | 0.05 h |
+|        P25 |   23.0 MB |  1.5 s | 1.5 s |     2.0 s |      332 | 0.61 h |
+|        P50 |   70.6 MB |  4.3 s | 4.3 s |     5.3 s |    1,862 | 1.76 h |
+|        P75 |   91.6 MB |  5.6 s | 5.0 s |     6.9 s |    2,671 | 2.20 h |
+|        P90 |  113.7 MB |  7.1 s | 6.4 s |     8.4 s |    3,844 | 2.83 h |
+|        P99 |  332.1 MB | 20.6 s | 18.6 s |    23.8 s |    8,450 | 8.15 h |
 
-Subset:
+### Qwen3 vLLM vs SenseVoice (2026-02-20)
 
-- Source: full `download/` tree
-- Selection: deterministic random sample (`seed=20260218`) of `60` files
-- Path: `benchmarks/ab_subset_20260218_60/download`
-- Duration: `347,169s` (`~96.4358h`)
+Benchmark on `download/2013/` (14 files, 15.4 h audio), RTX 5090, cold start, VAD cached:
 
-Method:
+| Engine | Wall time | Realtime factor | Peak RAM |
+| ------ | --------: | --------------: | -------: |
+| SenseVoice (direct CTC) | **78.0 s** | **711×** | 10.2 GB |
+| Qwen3 vLLM (1.7B, bypass) | 100.3 s | 553× | 6.3 GB |
 
-1. No warmup pass
-2. No persistent worker
-3. Fresh output dir and fresh VAD cache per case
-4. Runtime telemetry sampled every 2s (`nvidia-smi` + `/proc/meminfo`)
+SenseVoice is **1.29× faster** on pure ASR inference. However, for production (14K+ files where VAD dominates wall time), the engine choice matters less.
 
-Artifacts:
+## Recommended production command
 
-- `benchmarks/ab_short_20260218_085205/results.json`
-- `benchmarks/ab_short_20260218_085205/A_baseline_current/run.log`
-- `benchmarks/ab_short_20260218_085205/B_aggressive_ram_gpu/run.log`
+```bash
+tmux new -s transcribe ./run_production.sh
+```
 
-Cases:
-
-- `A_baseline_current`:
-  - `--prep-workers 4`
-  - `--vad-workers 1`
-  - `--super-batch-active-files 8`
-  - `--super-batch-preload-files 10`
-  - `--super-batch-max-decoded-gib 6`
-  - `--asr-prefetch-batches 2`
-  - `--vllm-gpu-memory-utilization 0.70`
-- `B_aggressive_ram_gpu`:
-  - `--prep-workers 8`
-  - `--vad-workers 1`
-  - `--super-batch-active-files 12`
-  - `--super-batch-preload-files 16`
-  - `--super-batch-max-decoded-gib 12`
-  - `--asr-prefetch-batches 4`
-  - `--vllm-gpu-memory-utilization 0.85`
-
-Results:
-
-| Case | Wall time (s) | Realtime (x) | Avg GPU util | Avg VRAM (MiB) | Peak VRAM (MiB) | Avg RAM used (GiB) | Peak RAM used (GiB) |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `A_baseline_current` | 715.70 | 485.08 | 66.8% | 25,550 | 29,929 | 14.97 | 18.45 |
-| `B_aggressive_ram_gpu` | 719.67 | 482.40 | 65.9% | 29,670 | 32,071 | 15.77 | 21.87 |
-
-- Speedup (`B / A` in throughput terms): **0.994x** (aggressive was ~0.6% slower)
-
-Observed effect:
-
-- We successfully increased memory usage:
-  - VRAM average +`4.1 GiB` (about `+16%`)
-  - Peak VRAM reached ~`32.1/32.6 GiB`
-  - Peak RAM used increased from `18.45` to `21.87 GiB`
-- But wall-clock did not improve; increased buffering/parallelism did not remove the dominant bottlenecks for this workload.
-
-Conclusion:
-
-- For first full-folder run, the baseline cold config remains the best tested choice.
-- More RAM/VRAM utilization alone does not guarantee lower end-to-end time in this pipeline.
-
-## Experiment E: Can `vad_workers > 1` on GPU speed up vLLM?
-
-Goal: test whether multi-worker GPU VAD increases end-to-end speed.
-
-Implementation note:
-
-- Added `--vad-device {auto,cpu,cuda}` so VAD device policy is explicit.
-- `auto` keeps existing behavior; `cuda` allows forcing GPU VAD even when `vad_workers > 1`.
-
-Dataset / method:
-
-- Dataset: `download/2013` (`~15.4041h`)
-- No warmup, no persistent worker
-- Common flags:
-  - `--asr-backend vllm`
-  - `--prep-workers 4`
-  - `--super-batch-active-files 8`
-  - `--super-batch-preload-files 10`
-  - `--super-batch-max-decoded-gib 6`
-  - `--asr-prefetch-batches 2`
-  - `--vllm-gpu-memory-utilization 0.7`
-- Fresh output + VAD cache per case
-
-Artifacts:
-
-- `benchmarks/vad_gpu_workers_20260218_095443/results.json`
-
-Results:
-
-| Case | Key VAD settings | Wall time (s) | Relative to best |
-|---|---|---:|---:|
-| `w1_gpu_auto` | `--vad-workers 1 --vad-device auto` (GPU VAD) | 180.03 | 1.000x |
-| `w4_cpu_auto` | `--vad-workers 4 --vad-device auto` (CPU VAD) | 192.02 | 0.938x |
-| `w4_gpu_forced` | `--vad-workers 4 --vad-device cuda` (GPU VAD) | 193.03 | 0.933x |
-
-Observed effect:
-
-- For this workload, `vad_workers > 1` did **not** improve speed.
-- Forcing multi-worker VAD onto GPU was slightly worse than both:
-  - baseline `w1_gpu_auto` (about `7.2%` slower),
-  - and `w4_cpu_auto` (about `0.5%` slower).
-
-Conclusion:
-
-- Keep `--vad-workers 1` as the default best setting.
-- Multi-worker GPU VAD is supported now (via `--vad-device cuda`) but not faster in tested conditions.
+All defaults are tuned for RTX 5090 + 9950X3D + 58 GB RAM. No flags needed.

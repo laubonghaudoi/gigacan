@@ -5,7 +5,7 @@
 - 模型 [qwen3-asr-flash](https://bailian.console.aliyun.com/?tab=model#/model-market/detail/group-qwen3-asr-flash?modelGroup=group-qwen3-asr-flash)
 - [阿里雲餘額](https://billing-cost.console.aliyun.com/fortune/billing-account)
 
-## 1 下載影片流程
+## 1 下載影片
  
 呢一步要反覆試錯，因為 yt-dlp 下載經常會中斷。而且需要好多儲存空間，所以要經常𥄫住然後人手重試。首先要確定目標頻道或者播放清單，然後針對
 
@@ -20,21 +20,62 @@
         ```
         會自動按照個 csv 檢查一次所有下載好嘅 OPUS。如果遇到個長度唔對應嘅，就會刪除呢條 OPUS 然後喺 csv 入面標記`downloaded=False`
     1. 再重複跑 `uv run 2_download_audio.py`，直至將所有 opus 都下載齊為止。
-1. 所有片都終於下載晒之後，`uv run 3_generate_metadata.py`，會生成一個 `metadata.csv`，作為 HF 上面數據集嘅超數據。
-1. 按照 `HF_UPLOAD_STEPS.md` 入面步驟跑
-    ```bash
-    python 3_make_webdataset.py metadata.csv webdataset --dry-run
-    ```
-    會列出總共需要分成幾多個 tar 上傳到 HF 做數據集。確定冇問題之後刪去 `--dry-run` 再跑多次。
-1. 
 
 ## 2 轉寫字幕
 
+### 全量轉寫（推薦）
+
+用 `tmux` 跑生產腳本，會自動記錄 GPU/RAM/進度：
+
+```bash
+# Qwen3-ASR 1.7B + vLLM（預設，質素最好）
+tmux new -s transcribe './run_production.sh'
+
+# SenseVoice（推理快 ~13%，但質素略遜）
+tmux new -s transcribe './run_production.sh sensevoice'
+```
+
+所有參數已經針對 RTX 5090 + 9950X3D + 58 GB RAM 調校至最優，唔需要手動加任何 flag。日誌輸出喺 `benchmarks/production_<timestamp>/`。
+
+睇進度（attach 返去 tmux session 就會見到 tqdm 進度條）：
+
+```bash
+tmux attach -t transcribe
+```
+
+按 `Ctrl+B` 然後 `D` 可以 detach 返出嚟（唔會中斷任務）。
+
+亦可以喺另一個 terminal 睇 GPU/RAM 監控：
+
+```bash
+tail -f benchmarks/production_*/monitor.log
+```
+
+如果中斷咗，直接重新跑返就得，已轉寫嘅會自動跳過，VAD 結果亦有 cache。
+
+### 最優預設參數
+
+Pipeline 預設值（`src/gigacan/qwen_srt/config.py`）：
+
+| 參數 | 預設值 | 說明 |
+| ---- | -----: | ---- |
+| VAD pre-compute workers | 8 | Phase 1 multiprocessing VAD 工人數 |
+| `prep_workers` / `vad_workers` | 24 | Phase 2 解碼工人數 |
+| `super_batch_max_decoded_gib` | 25.0 | 解碼音頻 RAM 上限 |
+| `vllm_max_model_len` | 4096 | vLLM KV cache 長度（ASR 序列只需 ~300-500 token） |
+| `vllm_max_num_seqs` | 256 | vLLM 並行序列數 |
+| `vllm_gpu_memory_utilization` | 0.9 | vLLM GPU 記憶體佔用比例 |
+| `segment_batch_size` | 1536 | segment queue 容量 |
+
+Pipeline 會先用 multiprocessing 預計算所有 VAD（Phase 1，CPU 全核跑滿），然後再跑 GPU 推理（Phase 2，GPU 35-96%）。兩個階段都有 tqdm 進度條。詳見 `optimization.md`。
+
+### 其他用法
+
 1. `uv run transcribe`（預設會遞迴掃描 `download/`，並將字幕輸出到 `transcriptions/<year>/*.srt`）
 1. 只跑某一年：`uv run transcribe --year 2025`
-1. 預設使用 `vllm` backend；可用 `--asr-backend transformers` 切換
-1. `vllm` 可調：`--vllm-gpu-memory-utilization`、`--vllm-tensor-parallel-size`
-1. `transformers` 可調：`--qwen-dtype`（`auto`=CUDA 用 `bfloat16`，CPU 用 `float32`）
+1. 預設使用 `--asr-engine qwen3`（Qwen3-ASR-1.7B + vLLM）；可用 `--asr-engine sensevoice` 切換
+1. `qwen3` 可調：`--vllm-gpu-memory-utilization`、`--vllm-tensor-parallel-size`、`--qwen-language`、`--qwen-context`、`--use-prompt`
+1. `sensevoice` 可調：`--asr-model-hub`、`--asr-language`、`--no-asr-use-itn`
 1. 單檔模式：`uv run transcribe --audio download/2026/J-ajS2LNnfs.opus --output-srt ./no_prompt.srt`
 1. 用 `zh-hk` 參考字幕修正 Qwen 轉寫（唔會用 `yue` 直接改字）：
    ```bash
@@ -55,56 +96,15 @@
 1. 讀取 `cut/` 入面切分好嘅音頻，上傳數據集到 HuggingFace
 1. 刪除 `download`/ 同埋 `vtt/`入面嘅文檔，開始下一個播放清單重複以上步驟。
 
+## 上傳到 HF
 
-## 3 轉寫優化記錄（2026-02-18 更新）
-
-以下係目前已經落地嘅所有轉寫優化：
-
-1. **批量流程 + CLI 能力**
-   1. `transcribe` 支援遞迴掃描 `download/`，輸出到 `transcriptions/<year>/*.srt`。
-   1. 支援 `--year` 只跑某一年。
-   1. 支援單檔模式同批量模式共存。
-   1. 進度條改為整體文件級進度（總文件數 + 已完成/失敗）。
-1. **可恢復（resumable）機制**
-   1. 預設 skip 已存在 `.srt`（除非 `--overwrite`），中斷後可直接續跑。
-   1. `write_srt` 採用臨時文件 + `os.replace` 原子寫入，避免中斷時留下破損 SRT。
-1. **ASR 後端**
-   1. 支援 `vllm` 同 `transformers` 兩種 backend。
-   1. 預設 backend 係 `vllm`；`transformers` 可用 `--asr-backend transformers` 切換。
-   1. `--qwen-dtype auto`：CUDA 會用 `bfloat16`，CPU 會用 `float32`（transformers backend）。
-   1. `vllm` 可用 `--vllm-gpu-memory-utilization` 同 `--vllm-tensor-parallel-size` 微調。
-1. **Persistent Worker（常駐進程）**
-   1. 支援 UNIX socket 常駐 worker，重用已載入模型，減少反覆冷啟動。
-   1. 支援 `ping/shutdown` 同 runtime signature 檢查；配置改變會自動重啟 worker。
-1. **跨文件 Super-batching（核心提速）**
-   1. 實作 global cross-file segment queue，唔再單文件串行餵 GPU。
-   1. 引入 frame-aware batch 選擇，降低 padding 浪費。
-   1. 支援 ASR payload prefetch（`--asr-prefetch-batches`）做 CPU/GPU pipeline overlap。
-   1. 新增長短文件交錯排序（唔再純長檔優先）減少記憶體尖峰。
-1. **CPU / VAD 並行化**
-   1. decode prep + VAD 採用 thread pools（`--prep-workers` / `--vad-workers`）。
-   1. GPU ASR 場景下可將 VAD 放 CPU，減少同 GPU 推理互搶。
-1. **VAD 優化**
-   1. 新增 VAD cache（`.cache/qwen_srt_vad`），重跑可重用已做過 VAD 結果。
-   1. 支援短 segment 過濾 + segment merge（`merge-target/max/gap`）降低碎片化。
-1. **穩定性與容錯**
-   1. `--continue-on-error` 允許大批量任務容錯繼續跑。
-   1. ASR batch 出錯時有 binary-split fallback，盡量隔離壞樣本而唔係全批中止。
-1. **記憶體壓力治理**
-   1. decode backlog 有上限，避免 decoded audio 無上限堆積。
-   1. 新增 decoded audio RAM budget（`--super-batch-max-decoded-gib`，`0`=auto），producer 會按預算 backpressure。
-   1. 目前 full-run 預設配置（SenseVoice）：
-      `--segment-batch-size 1536 --prep-workers 20 --vad-workers 1 --super-batch-active-files 48 --super-batch-preload-files 96 --super-batch-queue-multiplier 48 --super-batch-max-decoded-gib 40 --asr-prefetch-batches 24 --vad-max-segment-ms 15000 --vad-max-end-silence-ms 500`
-1. **進度掃描整合**
-   1. `legco.csv` 新增 `transcribed` 欄位。
-   1. `2_scan_progress.py` 已同步掃描 `transcriptions/**/*.srt` 並更新 `transcribed`。
-1. **基準測試（2013 年全集，14 files，約 15.40 小時音頻，2026-02-18 warm-run）**
-   1. vLLM（persistent worker warm-run）：`96.35s`，約 `575.56x` realtime。
-   1. transformers（同等流程 + persistent worker warm-run）：`337.42s`，約 `164.35x` realtime。
-   1. vLLM 相對 transformers 約 `3.50x` 提速。
-   1. 詳細報告：`benchmarks/benchmark_2013_20260218_072910.md`。
-   1. 再盲目加大 RAM window（例如 active/preload/workers 全面上推）未必更快，曾觀察到吞吐反而下降。
-
+1. 所有片都終於下載晒之後，`uv run 3_generate_metadata.py`，會生成一個 `metadata.csv`，作為 HF 上面數據集嘅超數據。
+1. 按照 `HF_UPLOAD_STEPS.md` 入面步驟跑
+    ```bash
+    python 3_make_webdataset.py metadata.csv webdataset --dry-run
+    ```
+    會列出總共需要分成幾多個 tar 上傳到 HF 做數據集。確定冇問題之後刪去 `--dry-run` 再跑多次。
+1. 
 
 
 HF_XET_CACHE=/home/jupyter/xet-cache python 4_upload_to_hf.py --year 2025 --repo_id laubonghaudoi/legco --config-name raw --staging-dir /home/jupyter/xet-cache/staging && \

@@ -13,19 +13,19 @@ from gigacan.qwen_srt.config import TranscribeConfig
 from gigacan.qwen_srt.runtime import _apply_cmvn, _apply_lfr
 
 
-def _config(*, backend: str) -> TranscribeConfig:
+def _config(*, engine: str) -> TranscribeConfig:
     return TranscribeConfig(
         audio=Path("a.opus"),
         output_srt=Path("a.srt"),
-        asr_backend=backend,
+        asr_engine=engine,
     )
 
 
 def test_build_asr_model_dispatches_to_sensevoice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(backend="sensevoice")
-    called: dict[str, int] = {"sensevoice": 0}
+    config = _config(engine="sensevoice")
+    called: dict[str, int] = {"sensevoice": 0, "qwen_vllm": 0}
 
     def fake_sensevoice(
         _config: TranscribeConfig,
@@ -35,17 +35,26 @@ def test_build_asr_model_dispatches_to_sensevoice(
         called["sensevoice"] += 1
         return "sensevoice-model"
 
+    def fake_qwen_vllm(
+        _config: TranscribeConfig,
+        _resolved_device: str,
+        _segment_batch_size: int,
+    ) -> str:
+        called["qwen_vllm"] += 1
+        return "qwen-vllm-model"
+
     monkeypatch.setattr(runtime, "build_asr_model_sensevoice", fake_sensevoice)
+    monkeypatch.setattr(runtime, "build_asr_model_qwen_vllm", fake_qwen_vllm)
     result = runtime.build_asr_model(config, "cuda:0", 32)
     assert result == "sensevoice-model"
-    assert called == {"sensevoice": 1}
+    assert called == {"sensevoice": 1, "qwen_vllm": 0}
 
 
-def test_build_asr_model_allows_transformers_alias(
+def test_build_asr_model_dispatches_to_qwen_vllm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(backend="transformers")
-    called: dict[str, int] = {"sensevoice": 0}
+    config = _config(engine="qwen3")
+    called: dict[str, int] = {"sensevoice": 0, "qwen_vllm": 0}
 
     def fake_sensevoice(
         _config: TranscribeConfig,
@@ -55,22 +64,47 @@ def test_build_asr_model_allows_transformers_alias(
         called["sensevoice"] += 1
         return "sensevoice-model"
 
+    def fake_qwen_vllm(
+        _config: TranscribeConfig,
+        _resolved_device: str,
+        _segment_batch_size: int,
+    ) -> str:
+        called["qwen_vllm"] += 1
+        return "qwen-vllm-model"
+
     monkeypatch.setattr(runtime, "build_asr_model_sensevoice", fake_sensevoice)
+    monkeypatch.setattr(runtime, "build_asr_model_qwen_vllm", fake_qwen_vllm)
     result = runtime.build_asr_model(config, "cuda:0", 32)
-    assert result == "sensevoice-model"
-    assert called == {"sensevoice": 1}
+    assert result == "qwen-vllm-model"
+    assert called == {"sensevoice": 0, "qwen_vllm": 1}
 
 
-def test_build_asr_model_rejects_vllm() -> None:
-    config = _config(backend="vllm")
-    with pytest.raises(RuntimeError):
-        runtime.build_asr_model(config, "cuda:0", 32)
-
-
-def test_build_asr_model_rejects_unknown_backend() -> None:
-    config = _config(backend="unknown")
+def test_build_asr_model_rejects_unknown_engine() -> None:
+    config = _config(engine="unknown")
     with pytest.raises(ValueError):
         runtime.build_asr_model(config, "cuda:0", 32)
+
+
+def test_resolve_vllm_device_sets_cuda_visible_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    resolved = runtime.resolve_vllm_device("cuda:2")
+    assert resolved == "cuda:0"
+    assert runtime.os.environ["CUDA_VISIBLE_DEVICES"] == "2"
+
+
+def test_resolve_vllm_device_rejects_conflicting_cuda_visible_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    with pytest.raises(RuntimeError):
+        runtime.resolve_vllm_device("cuda:2")
+
+
+def test_resolve_vllm_device_rejects_cpu() -> None:
+    with pytest.raises(RuntimeError):
+        runtime.resolve_vllm_device("cpu")
 
 
 def test_sensevoice_candidates_auto_includes_ms_and_hf() -> None:

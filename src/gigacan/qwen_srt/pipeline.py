@@ -11,7 +11,14 @@ from queue import Empty, Queue
 from threading import Condition, Thread, local
 from typing import Any
 
-from .audio import load_audio_mono_16k, slice_audio_segment
+import numpy as np
+
+from .audio import (
+    compute_vad_streaming,
+    load_audio_and_vad_streaming,
+    load_audio_mono_16k,
+    slice_audio_segment,
+)
 from .batch import BatchJob, sort_jobs_by_duration
 from .config import TranscribeConfig
 from .postprocess import CantonesePostProcessor, clean_asr_text
@@ -46,7 +53,9 @@ class PreparedTranscriber:
     asr_prefetch_batches: int
     vad_cache_dir: Path
     use_vad_cache: bool
+    asr_engine: str
     asr_language: str
+    asr_context: str
 
 
 @dataclass(slots=True)
@@ -137,6 +146,15 @@ def estimate_feature_frames(duration_ms: int, frame_ms: int = 10) -> int:
     return max(1, (safe_duration_ms + safe_frame_ms - 1) // safe_frame_ms)
 
 
+def resolve_context_prompt(config: TranscribeConfig) -> str:
+    if config.asr_engine.strip().lower() != "qwen3":
+        return ""
+    if not config.use_prompt:
+        return ""
+    prompt = config.qwen_context.strip()
+    return prompt
+
+
 def resolve_vad_device_policy(
     *,
     aux_device: str,
@@ -162,15 +180,15 @@ def resolve_vad_device_policy(
 
 
 def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
-    resolved_backend = config.asr_backend.strip().lower()
-    if resolved_backend == "vllm":
-        raise RuntimeError(
-            "SenseVoice does not support the vLLM backend. "
-            "Use --asr-backend sensevoice or --asr-backend transformers."
-        )
-    if resolved_backend not in {"sensevoice", "transformers"}:
-        raise ValueError(f"Unsupported ASR backend: {config.asr_backend}")
+    resolved_engine = config.asr_engine.strip().lower()
+    if resolved_engine not in {"sensevoice", "qwen3"}:
+        raise ValueError(f"Unsupported ASR engine: {config.asr_engine}")
     resolved_device = resolve_device(config.device)
+    if resolved_engine == "qwen3" and not resolved_device.startswith("cuda"):
+        raise RuntimeError(
+            f"Qwen3 vLLM requires CUDA, got resolved device {resolved_device!r}. "
+            "Use --asr-engine sensevoice on CPU."
+        )
     segment_batch_size = resolve_segment_batch_size(
         resolved_device,
         config.segment_batch_size,
@@ -180,22 +198,44 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         if config.vad_workers > 0
         else (4 if resolved_device.startswith("cuda") else 2)
     )
+    aux_device = (
+        "cuda:0"
+        if resolved_engine == "qwen3" and resolved_device.startswith("cuda")
+        else resolved_device
+    )
     vad_device = resolve_vad_device_policy(
-        aux_device=resolved_device,
+        aux_device=aux_device,
         resolved_vad_workers=resolved_vad_workers,
         vad_device_policy=config.vad_device,
+    )
+    context_prompt = resolve_context_prompt(config)
+    asr_language = (
+        config.asr_language
+        if resolved_engine == "sensevoice"
+        else config.qwen_language
     )
     import torch as _torch
 
     saved_threads = _torch.get_num_threads()
     asr_model = build_asr_model(config, resolved_device, segment_batch_size)
 
-    print(f"ASR backend: {resolved_backend}")
-    print(f"ASR model: {config.asr_model} ({config.asr_model_hub})")
+    print(f"ASR engine: {resolved_engine}")
+    if resolved_engine == "sensevoice":
+        print(f"ASR model: {config.asr_model} ({config.asr_model_hub})")
+        print(f"ASR ITN: {'enabled' if config.asr_use_itn else 'disabled'}")
+    else:
+        print(f"ASR model: {config.qwen_model} (vllm)")
+        print(
+            "vLLM settings: "
+            f"gpu_memory_utilization={config.vllm_gpu_memory_utilization}, "
+            f"tensor_parallel_size={config.vllm_tensor_parallel_size}, "
+            f"max_model_len={config.vllm_max_model_len}, "
+            f"max_num_seqs={config.vllm_max_num_seqs}"
+        )
+        print(f"Qwen prompt: {'enabled' if bool(context_prompt) else 'disabled'}")
     print(f"Using device: {resolved_device}")
     print(f"Using VAD device: {vad_device}")
-    print(f"ASR language: {config.asr_language}")
-    print(f"ASR ITN: {'enabled' if config.asr_use_itn else 'disabled'}")
+    print(f"ASR language: {asr_language}")
     print(f"VAD max end silence: {config.vad_max_end_silence_ms} ms")
     print(f"Segment batch size: {segment_batch_size}")
 
@@ -228,7 +268,9 @@ def prepare_transcriber(config: TranscribeConfig) -> PreparedTranscriber:
         asr_prefetch_batches=config.asr_prefetch_batches,
         vad_cache_dir=config.vad_cache_dir,
         use_vad_cache=config.use_vad_cache,
-        asr_language=config.asr_language,
+        asr_engine=resolved_engine,
+        asr_language=asr_language,
+        asr_context=context_prompt,
     )
 
 
@@ -237,6 +279,7 @@ def collect_vad_segments(
     audio: Path,
     *,
     vad_model: Any | None = None,
+    audio_samples: np.ndarray | None = None,
 ) -> list[tuple[int, int]]:
     base_segments: list[tuple[int, int]] | None = None
     if runtime.use_vad_cache:
@@ -252,7 +295,10 @@ def collect_vad_segments(
 
     if base_segments is None:
         active_vad_model = runtime.vad_model if vad_model is None else vad_model
-        vad_res = active_vad_model.generate(input=str(audio))
+        vad_input: str | np.ndarray = (
+            audio_samples if audio_samples is not None else str(audio)
+        )
+        vad_res = active_vad_model.generate(input=vad_input)
         if not vad_res or "value" not in vad_res[0]:
             raise RuntimeError(f"Unexpected VAD output for {audio}: {vad_res}")
         raw_segments = vad_res[0]["value"]
@@ -560,6 +606,7 @@ def transcribe_audio_to_srt(
 
         results = runtime.asr_model.transcribe(
             audio=batch_audio,
+            context=runtime.asr_context,
             language=runtime.asr_language,
         )
         if len(results) != len(batch_segments):
@@ -583,6 +630,175 @@ def transcribe_audio_to_srt(
     if log_segments:
         print(f"Wrote SRT: {output_srt}")
     return output_srt
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing VAD pre-computation
+# ---------------------------------------------------------------------------
+
+def _vad_worker_init(
+    vad_device: str,
+    vad_max_segment_ms: int,
+    vad_max_end_silence_ms: int,
+) -> None:
+    """Initializer for each multiprocessing worker process."""
+    import torch as _torch
+    _torch.set_num_threads(1)
+
+    global _mp_vad_model  # noqa: PLW0603
+    _mp_vad_model = build_vad_model(
+        vad_device,
+        vad_max_segment_ms,
+        vad_max_end_silence_ms,
+    )
+
+
+def _vad_worker_fn(
+    args: tuple[str, int, str, int, int],
+) -> tuple[str, int, int, bool]:
+    """Process one file: streaming decode+VAD, save to cache.
+
+    Returns (path, n_segments, file_bytes, ok).
+    """
+    audio_path_str, min_segment_ms, cache_dir_str, vad_max_segment_ms, vad_max_end_silence_ms = args
+    audio_path = Path(audio_path_str)
+    cache_dir = Path(cache_dir_str)
+    file_bytes = 0
+    try:
+        file_bytes = audio_path.stat().st_size
+        cached = load_vad_cache(
+            cache_dir, audio_path,
+            min_segment_ms=min_segment_ms,
+            vad_max_segment_ms=vad_max_segment_ms,
+            vad_max_end_silence_ms=vad_max_end_silence_ms,
+        )
+        if cached is not None:
+            return (audio_path_str, len(cached), file_bytes, True)
+
+        raw_segments = compute_vad_streaming(audio_path, _mp_vad_model)  # type: ignore[name-defined]  # noqa: F821
+        base_segments = [
+            (s, e) for s, e in raw_segments if e - s >= min_segment_ms
+        ]
+        save_vad_cache(
+            cache_dir, audio_path,
+            min_segment_ms=min_segment_ms,
+            vad_max_segment_ms=vad_max_segment_ms,
+            vad_max_end_silence_ms=vad_max_end_silence_ms,
+            segments=base_segments,
+        )
+        return (audio_path_str, len(base_segments), file_bytes, True)
+    except Exception as exc:
+        print(f"VAD failed for {audio_path}: {type(exc).__name__}: {exc}")
+        return (audio_path_str, 0, file_bytes, False)
+
+
+def precompute_vad_multiprocessing(
+    jobs: Sequence[BatchJob],
+    runtime: PreparedTranscriber,
+    *,
+    max_workers: int | None = None,
+) -> None:
+    """Pre-compute VAD for all files using multiprocessing (bypasses GIL).
+
+    Each worker process has its own VAD model and Python GIL, allowing
+    true parallelism for the CPU-bound FSMN-VAD computation.  Results
+    are saved to the VAD cache so the main pipeline gets instant cache
+    hits and only needs to run ffmpeg decode (subprocess, GIL-free).
+    """
+    import multiprocessing as mp
+    import time as _time
+
+    if max_workers is None:
+        max_workers = max(1, min(8, resolve_logical_cpu_count()))
+
+    audio_paths = [str(j.audio) for j in jobs if j.audio.is_file()]
+    if not audio_paths:
+        return
+
+    cache_dir = str(runtime.vad_cache_dir)
+    min_seg = runtime.min_segment_ms
+    vad_max_seg = runtime.vad_max_segment_ms
+    vad_silence = runtime.vad_max_end_silence_ms
+    vad_device = runtime.vad_device
+
+    already_cached = 0
+    to_compute: list[str] = []
+    for p in audio_paths:
+        cached = load_vad_cache(
+            Path(cache_dir), Path(p),
+            min_segment_ms=min_seg,
+            vad_max_segment_ms=vad_max_seg,
+            vad_max_end_silence_ms=vad_silence,
+        )
+        if cached is not None:
+            already_cached += 1
+        else:
+            to_compute.append(p)
+
+    to_compute.sort(key=lambda p: Path(p).stat().st_size)
+
+    if not to_compute:
+        print(f"VAD pre-computation: all {already_cached} files already cached, skipping.")
+        return
+
+    total_bytes = sum(Path(p).stat().st_size for p in to_compute)
+
+    print(
+        f"VAD pre-computation: {already_cached} cached, "
+        f"{len(to_compute)} to compute ({total_bytes / 1e9:.1f} GB) "
+        f"using {max_workers} processes..."
+    )
+    t0 = _time.monotonic()
+
+    from tqdm import tqdm
+
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        processes=max_workers,
+        initializer=_vad_worker_init,
+        initargs=(vad_device, vad_max_seg, vad_silence),
+    ) as pool:
+        task_args = [
+            (p, min_seg, cache_dir, vad_max_seg, vad_silence)
+            for p in to_compute
+        ]
+        failed = 0
+        bytes_done = 0
+        total_segments = 0
+
+        with tqdm(
+            total=len(to_compute),
+            unit="file",
+            desc="VAD pre-compute",
+            dynamic_ncols=True,
+            bar_format=(
+                "{l_bar}{bar}| {n_fmt}/{total_fmt} files "
+                "[{elapsed}<{remaining}, {rate_fmt}, "
+                "{postfix}]"
+            ),
+        ) as pbar:
+            for path_str, n_segs, file_bytes, ok in pool.imap_unordered(
+                _vad_worker_fn, task_args, chunksize=8,
+            ):
+                if not ok:
+                    failed += 1
+                bytes_done += file_bytes
+                total_segments += n_segs
+                pbar.update(1)
+                pbar.set_postfix_str(
+                    f"{bytes_done / 1e9:.1f}/{total_bytes / 1e9:.0f}GB "
+                    f"{total_segments:,}segs "
+                    f"{failed}err",
+                    refresh=False,
+                )
+
+    elapsed = _time.monotonic() - t0
+    print(
+        f"VAD pre-computation done: {len(to_compute)} files "
+        f"({total_bytes / 1e9:.1f} GB) in {elapsed:.1f}s "
+        f"({len(to_compute) / elapsed:.1f} files/s), "
+        f"{total_segments:,} segments, {failed} failed."
+    )
 
 
 def transcribe_batch_to_srt_superbatched(
@@ -639,6 +855,10 @@ def transcribe_batch_to_srt_superbatched(
     )
 
     ordered_jobs = sort_jobs_by_duration(jobs)
+
+    if runtime.use_vad_cache:
+        precompute_vad_multiprocessing(ordered_jobs, runtime)
+
     completed = 0
     failures: list[tuple[Path, str]] = []
     prepared_queue: Queue[PreparedJobItem] = Queue(maxsize=resolved_preload_files)
@@ -650,17 +870,18 @@ def transcribe_batch_to_srt_superbatched(
     decoded_bytes_accounted = 0
     use_direct_inference: bool = getattr(runtime.asr_model, "_direct_ready", False)
 
-    def reserve_decoded_budget(requested_bytes: int) -> int:
+    def try_reserve_decoded_budget(requested_bytes: int) -> int | None:
+        """Try to reserve budget without blocking. Returns reserved bytes or None."""
         nonlocal decoded_bytes_accounted
         reserved = max(1, int(requested_bytes))
         with decoded_budget_cv:
-            while (
-                decoded_bytes_accounted + reserved > decoded_budget_bytes
-                and decoded_bytes_accounted > 0
+            if (
+                decoded_bytes_accounted + reserved <= decoded_budget_bytes
+                or decoded_bytes_accounted == 0
             ):
-                decoded_budget_cv.wait(timeout=0.2)
-            decoded_bytes_accounted += reserved
-        return reserved
+                decoded_bytes_accounted += reserved
+                return reserved
+        return None
 
     def release_decoded_budget(released_bytes: int) -> None:
         nonlocal decoded_bytes_accounted
@@ -707,6 +928,7 @@ def transcribe_batch_to_srt_superbatched(
         if state.failed or state.done:
             return
         state.job.output_srt.parent.mkdir(parents=True, exist_ok=True)
+        state.entries.sort()
         write_srt(state.job.output_srt, state.entries)
         release_state_audio(state)
         state.done = True
@@ -723,18 +945,9 @@ def transcribe_batch_to_srt_superbatched(
             on_file_done(job.audio)
 
     def producer() -> None:
-        pending_vads: dict[Future[list[tuple[int, int]]], BatchJob] = {}
-        pending_decodes: dict[
-            Future[tuple[Any, int]],
-            tuple[BatchJob, list[tuple[int, int]], int],
-        ] = {}
-        vad_backlog_limit = max(
-            resolved_active_files + resolved_vad_workers,
-            resolved_vad_workers * 2,
-        )
-        # Decoded audio payloads are the dominant host RAM consumer.
-        # Never allow decode backlog to exceed preload window capacity.
-        decode_backlog_limit = min(
+        PrepResult = tuple[list[tuple[int, int]], np.ndarray, int]
+        pending_jobs: dict[Future[PrepResult], tuple[BatchJob, int]] = {}
+        backlog_limit = min(
             resolved_preload_files,
             max(
                 resolved_active_files + resolved_prep_workers,
@@ -743,39 +956,93 @@ def transcribe_batch_to_srt_superbatched(
         )
         vad_local = local()
 
-        def collect_segments_for_job(job: BatchJob) -> list[tuple[int, int]]:
-            if resolved_vad_workers <= 1:
-                return collect_vad_segments(runtime, job.audio)
-            worker_model = getattr(vad_local, "model", None)
-            if worker_model is None:
-                worker_model = build_vad_model(
+        def estimate_file_decode_bytes(audio_path: Path) -> int:
+            """Estimate decoded 16kHz mono float32 size from file size."""
+            file_bytes = audio_path.stat().st_size
+            return max(1, int(file_bytes * 5.5))
+
+        def _ensure_worker_model() -> Any:
+            import torch as _torch
+
+            model = getattr(vad_local, "model", None)
+            if model is None:
+                model = build_vad_model(
                     vad_worker_device,
                     runtime.vad_max_segment_ms,
                     runtime.vad_max_end_silence_ms,
                 )
-                setattr(vad_local, "model", worker_model)
-            return collect_vad_segments(runtime, job.audio, vad_model=worker_model)
+                setattr(vad_local, "model", model)
+                _torch.set_num_threads(1)
+            return model
 
-        def estimate_job_decode_bytes(segments: list[tuple[int, int]]) -> int:
-            if not segments:
-                return 1
-            estimated_duration_ms = max(end_ms for _, end_ms in segments)
-            return estimate_decoded_audio_bytes(estimated_duration_ms)
+        def decode_and_vad_for_job(
+            job: BatchJob,
+        ) -> PrepResult:
+            """Decode audio and run VAD, streaming chunks for overlap."""
+            if runtime.use_vad_cache:
+                cached = load_vad_cache(
+                    runtime.vad_cache_dir,
+                    job.audio,
+                    min_segment_ms=runtime.min_segment_ms,
+                    vad_max_segment_ms=runtime.vad_max_segment_ms,
+                    vad_max_end_silence_ms=runtime.vad_max_end_silence_ms,
+                )
+                if cached is not None:
+                    audio_samples, audio_sr = load_audio_mono_16k(job.audio)
+                    segments = merge_small_vad_segments(
+                        cached,
+                        target_segment_ms=runtime.merge_target_segment_ms,
+                        max_segment_ms=runtime.merge_max_segment_ms,
+                        max_gap_ms=runtime.merge_max_gap_ms,
+                    )
+                    return segments, audio_samples, audio_sr
 
-        def drain_decodes(*, block: bool) -> None:
-            if not pending_decodes:
+            if resolved_vad_workers <= 1:
+                worker_model = runtime.vad_model
+            else:
+                worker_model = _ensure_worker_model()
+
+            raw_segments, audio_samples, audio_sr = load_audio_and_vad_streaming(
+                job.audio, worker_model,
+            )
+
+            base_segments = [
+                (s, e) for s, e in raw_segments
+                if e - s >= runtime.min_segment_ms
+            ]
+
+            if runtime.use_vad_cache:
+                save_vad_cache(
+                    runtime.vad_cache_dir,
+                    job.audio,
+                    min_segment_ms=runtime.min_segment_ms,
+                    vad_max_segment_ms=runtime.vad_max_segment_ms,
+                    vad_max_end_silence_ms=runtime.vad_max_end_silence_ms,
+                    segments=base_segments,
+                )
+
+            segments = merge_small_vad_segments(
+                base_segments,
+                target_segment_ms=runtime.merge_target_segment_ms,
+                max_segment_ms=runtime.merge_max_segment_ms,
+                max_gap_ms=runtime.merge_max_gap_ms,
+            )
+            return segments, audio_samples, audio_sr
+
+        def drain_jobs(*, block: bool) -> None:
+            if not pending_jobs:
                 return
             done, _ = wait(
-                set(pending_decodes),
+                set(pending_jobs),
                 timeout=None if block else 0.0,
                 return_when=FIRST_COMPLETED,
             )
             if not done:
                 return
             for future in done:
-                job, segments, reserved_bytes = pending_decodes.pop(future)
+                job, reserved_bytes = pending_jobs.pop(future)
                 try:
-                    audio_samples, audio_sr = future.result()
+                    segments, audio_samples, audio_sr = future.result()
                 except Exception as exc:  # noqa: BLE001
                     release_decoded_budget(reserved_bytes)
                     prepared_queue.put(
@@ -785,6 +1052,12 @@ def transcribe_batch_to_srt_superbatched(
                         )
                     )
                     continue
+
+                if not segments:
+                    release_decoded_budget(reserved_bytes)
+                    prepared_queue.put(PreparedJobItem(job=job))
+                    continue
+
                 actual_bytes = estimate_loaded_audio_bytes(audio_samples)
                 if actual_bytes > reserved_bytes:
                     adjust_decoded_budget(actual_bytes - reserved_bytes)
@@ -802,53 +1075,8 @@ def transcribe_batch_to_srt_superbatched(
                     )
                 )
 
-        with (
-            ThreadPoolExecutor(max_workers=resolved_prep_workers) as decode_pool,
-            ThreadPoolExecutor(max_workers=resolved_vad_workers) as vad_pool,
-        ):
-            def drain_vads(*, block: bool) -> None:
-                if not pending_vads:
-                    return
-                done, _ = wait(
-                    set(pending_vads),
-                    timeout=None if block else 0.0,
-                    return_when=FIRST_COMPLETED,
-                )
-                if not done:
-                    return
-                for future in done:
-                    job = pending_vads.pop(future)
-                    try:
-                        segments = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        prepared_queue.put(
-                            PreparedJobItem(
-                                job=job,
-                                failure=f"{type(exc).__name__}: {exc}",
-                            )
-                        )
-                        continue
-
-                    if not segments:
-                        prepared_queue.put(PreparedJobItem(job=job))
-                        continue
-
-                    reserved_bytes = reserve_decoded_budget(
-                        estimate_job_decode_bytes(segments)
-                    )
-                    try:
-                        decode_future = decode_pool.submit(load_audio_mono_16k, job.audio)
-                    except Exception as exc:  # noqa: BLE001
-                        release_decoded_budget(reserved_bytes)
-                        prepared_queue.put(
-                            PreparedJobItem(
-                                job=job,
-                                failure=f"{type(exc).__name__}: {exc}",
-                            )
-                        )
-                        continue
-                    pending_decodes[decode_future] = (job, segments, reserved_bytes)
-
+        pool_size = max(resolved_prep_workers, resolved_vad_workers)
+        with ThreadPoolExecutor(max_workers=pool_size) as pool:
             for job in ordered_jobs:
                 if not job.audio.is_file():
                     prepared_queue.put(
@@ -859,20 +1087,31 @@ def transcribe_batch_to_srt_superbatched(
                     )
                     continue
 
-                vad_future = vad_pool.submit(collect_segments_for_job, job)
-                pending_vads[vad_future] = job
-                drain_vads(block=False)
-                drain_decodes(block=False)
-                if len(pending_vads) >= vad_backlog_limit:
-                    drain_vads(block=True)
-                if len(pending_decodes) >= decode_backlog_limit:
-                    drain_decodes(block=True)
+                estimated = estimate_file_decode_bytes(job.audio)
+                reserved_bytes = try_reserve_decoded_budget(estimated)
+                while reserved_bytes is None:
+                    drain_jobs(block=True)
+                    reserved_bytes = try_reserve_decoded_budget(estimated)
 
-            while pending_vads:
-                drain_vads(block=True)
-                drain_decodes(block=False)
-            while pending_decodes:
-                drain_decodes(block=True)
+                try:
+                    future = pool.submit(decode_and_vad_for_job, job)
+                except Exception as exc:  # noqa: BLE001
+                    release_decoded_budget(reserved_bytes)
+                    prepared_queue.put(
+                        PreparedJobItem(
+                            job=job,
+                            failure=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+                    continue
+                pending_jobs[future] = (job, reserved_bytes)
+
+                drain_jobs(block=False)
+                if len(pending_jobs) >= backlog_limit:
+                    drain_jobs(block=True)
+
+            while pending_jobs:
+                drain_jobs(block=True)
         prepared_queue.put(PreparedJobItem(stop=True))
 
     producer_thread = Thread(target=producer, daemon=True)
@@ -1046,6 +1285,7 @@ def transcribe_batch_to_srt_superbatched(
             try:
                 subset_results = runtime.asr_model.transcribe(
                     audio=subset_audio,
+                    context=runtime.asr_context,
                     language=runtime.asr_language,
                 )
                 if len(subset_results) != len(subset_meta):
@@ -1090,6 +1330,7 @@ def transcribe_batch_to_srt_superbatched(
             else:
                 batch_results = runtime.asr_model.transcribe(
                     audio=batch_audio,
+                    context=runtime.asr_context,
                     language=runtime.asr_language,
                 )
             if len(batch_results) != len(batch_meta):

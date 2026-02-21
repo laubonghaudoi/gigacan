@@ -2,59 +2,179 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import numpy as np
-import torch
 
 
 TARGET_SAMPLE_RATE = 16000
+FFMPEG_CMD_BASE = [
+    "ffmpeg",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+]
+
+VAD_CHUNK_SECONDS = 600
+VAD_CHUNK_SAMPLES = VAD_CHUNK_SECONDS * TARGET_SAMPLE_RATE
+VAD_CHUNK_BYTES = VAD_CHUNK_SAMPLES * 4  # float32
+
+
+def _ffmpeg_decode_cmd(audio_path: Path) -> list[str]:
+    return [
+        *FFMPEG_CMD_BASE,
+        "-threads",
+        "1",
+        "-i",
+        str(audio_path),
+        "-ac",
+        "1",
+        "-ar",
+        str(TARGET_SAMPLE_RATE),
+        "-f",
+        "f32le",
+        "-acodec",
+        "pcm_f32le",
+        "-",
+    ]
 
 
 def load_audio_mono_16k(audio_path: Path) -> tuple[np.ndarray, int]:
-    """Load audio as mono 16kHz float32 samples."""
-    try:
-        import torchaudio
+    """Load audio as mono 16kHz float32 samples.
 
-        waveform, sample_rate = torchaudio.load(str(audio_path))
+    Uses ffmpeg to decode directly to 16kHz mono, avoiding the massive
+    intermediate buffers that torchaudio creates when loading at the
+    original sample rate (e.g. 48kHz stereo → ~14 GB for a 10h file).
+    """
+    proc = subprocess.run(
+        _ffmpeg_decode_cmd(audio_path), check=True, stdout=subprocess.PIPE,
+    )
+    audio = np.frombuffer(proc.stdout, dtype=np.float32).copy()
+    return audio, TARGET_SAMPLE_RATE
 
-        if waveform.ndim == 1:
-            waveform = waveform.unsqueeze(0)
-        if waveform.size(0) > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
 
-        if sample_rate != TARGET_SAMPLE_RATE:
-            waveform = torchaudio.functional.resample(
-                waveform,
-                orig_freq=sample_rate,
-                new_freq=TARGET_SAMPLE_RATE,
-            )
-            sample_rate = TARGET_SAMPLE_RATE
+def load_audio_and_vad_streaming(
+    audio_path: Path,
+    vad_model: Any,
+) -> tuple[list[tuple[int, int]], np.ndarray, int]:
+    """Decode audio and run VAD concurrently in a streaming fashion.
 
-        audio = waveform.squeeze(0).to(dtype=torch.float32).contiguous().cpu().numpy()
-        return audio, sample_rate
-    except Exception:
-        # TorchCodec may be unavailable in some environments; decode once via ffmpeg.
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(audio_path),
-            "-ac",
-            "1",
-            "-ar",
-            str(TARGET_SAMPLE_RATE),
-            "-f",
-            "s16le",
-            "-acodec",
-            "pcm_s16le",
-            "-",
-        ]
-        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE)
-        pcm16 = np.frombuffer(proc.stdout, dtype=np.int16)
-        audio = (pcm16.astype(np.float32) / 32768.0).copy()
-        return audio, TARGET_SAMPLE_RATE
+    A reader thread drains ffmpeg stdout into a queue while the caller
+    thread runs VAD on each chunk. Total time ≈ max(decode, VAD).
+    """
+    from queue import Queue
+    from threading import Thread
+
+    proc = subprocess.Popen(
+        _ffmpeg_decode_cmd(audio_path),
+        stdout=subprocess.PIPE,
+    )
+
+    chunk_queue: Queue[np.ndarray | None] = Queue(maxsize=2)
+
+    def _reader() -> None:
+        assert proc.stdout is not None
+        try:
+            while True:
+                raw = proc.stdout.read(VAD_CHUNK_BYTES)
+                if not raw:
+                    break
+                chunk_queue.put(np.frombuffer(raw, dtype=np.float32).copy())
+        finally:
+            chunk_queue.put(None)
+            proc.wait()
+
+    reader = Thread(target=_reader, daemon=True)
+    reader.start()
+
+    chunks: list[np.ndarray] = []
+    raw_segments: list[tuple[int, int]] = []
+    offset_ms = 0
+
+    while True:
+        chunk = chunk_queue.get()
+        if chunk is None:
+            break
+        chunks.append(chunk)
+
+        vad_res = vad_model.generate(input=chunk)
+        if vad_res and "value" in vad_res[0]:
+            for start, end in vad_res[0]["value"]:
+                raw_segments.append(
+                    (int(start) + offset_ms, int(end) + offset_ms)
+                )
+
+        offset_ms += len(chunk) * 1000 // TARGET_SAMPLE_RATE
+
+    reader.join()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, proc.args)
+
+    audio = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
+    return raw_segments, audio, TARGET_SAMPLE_RATE
+
+
+def compute_vad_streaming(
+    audio_path: Path,
+    vad_model: Any,
+) -> list[tuple[int, int]]:
+    """Streaming decode+VAD that only returns segment boundaries.
+
+    Unlike load_audio_and_vad_streaming, this does NOT accumulate the
+    decoded audio in memory.  Peak RAM per call ≈ one 10-min chunk
+    (~38 MB) regardless of file length.  Designed for multiprocessing
+    pre-computation where the full waveform is not needed.
+    """
+    from queue import Queue
+    from threading import Thread
+
+    proc = subprocess.Popen(
+        _ffmpeg_decode_cmd(audio_path),
+        stdout=subprocess.PIPE,
+    )
+
+    chunk_queue: Queue[np.ndarray | None] = Queue(maxsize=2)
+
+    def _reader() -> None:
+        assert proc.stdout is not None
+        try:
+            while True:
+                raw = proc.stdout.read(VAD_CHUNK_BYTES)
+                if not raw:
+                    break
+                chunk_queue.put(np.frombuffer(raw, dtype=np.float32).copy())
+        finally:
+            chunk_queue.put(None)
+            proc.wait()
+
+    reader = Thread(target=_reader, daemon=True)
+    reader.start()
+
+    raw_segments: list[tuple[int, int]] = []
+    offset_ms = 0
+
+    while True:
+        chunk = chunk_queue.get()
+        if chunk is None:
+            break
+
+        vad_res = vad_model.generate(input=chunk)
+        if vad_res and "value" in vad_res[0]:
+            for start, end in vad_res[0]["value"]:
+                raw_segments.append(
+                    (int(start) + offset_ms, int(end) + offset_ms)
+                )
+
+        offset_ms += len(chunk) * 1000 // TARGET_SAMPLE_RATE
+        del chunk
+
+    reader.join()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, proc.args)
+
+    return raw_segments
 
 
 def slice_audio_segment(

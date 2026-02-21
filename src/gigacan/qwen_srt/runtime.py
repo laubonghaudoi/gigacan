@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -28,6 +31,116 @@ def resolve_segment_batch_size(device: str, batch_size_arg: int) -> int:
     if device.startswith("cuda"):
         return 128
     return 4
+
+
+def ensure_qwen_source(src_dir: Path, repo_url: str) -> Path:
+    if (src_dir / "qwen_asr").is_dir():
+        return src_dir
+    src_dir.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "clone", "--depth", "1", repo_url, str(src_dir)],
+        check=True,
+    )
+    return src_dir
+
+
+def ensure_qwen_transformers_compat() -> None:
+    try:
+        import transformers.utils.generic as generic
+        from transformers import modeling_rope_utils
+    except Exception:
+        return
+
+    if not hasattr(generic, "check_model_inputs"):
+
+        def check_model_inputs(*_args: Any, **_kwargs: Any) -> Any:
+            def decorator(func: Any) -> Any:
+                return func
+
+            return decorator
+
+        generic.check_model_inputs = check_model_inputs  # type: ignore[attr-defined]
+
+    if "default" in modeling_rope_utils.ROPE_INIT_FUNCTIONS:
+        return
+
+    def qwen_default_rope_parameters(
+        config: Any = None,
+        device: Any = None,
+        seq_len: int | None = None,
+        layer_type: str | None = None,
+    ) -> tuple[torch.Tensor, float]:
+        del seq_len
+        if config is None:
+            raise ValueError("config is required for default rope parameters")
+
+        base = float(getattr(config, "rope_theta", 10000.0))
+        partial_rotary_factor = 1.0
+
+        if layer_type is not None and hasattr(config, "rope_parameters"):
+            rope_parameters = getattr(config, "rope_parameters")
+            if isinstance(rope_parameters, dict):
+                layer_params = rope_parameters.get(layer_type, {})
+                if isinstance(layer_params, dict):
+                    base = float(layer_params.get("rope_theta", base))
+                    partial_rotary_factor = float(
+                        layer_params.get("partial_rotary_factor", partial_rotary_factor)
+                    )
+
+        head_dim = getattr(config, "head_dim", None)
+        if head_dim is None:
+            head_dim = int(config.hidden_size) // int(config.num_attention_heads)
+
+        dim = int(head_dim * partial_rotary_factor)
+        if dim < 2:
+            dim = 2
+        if dim % 2 == 1:
+            dim -= 1
+            if dim < 2:
+                dim = 2
+
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.float32, device=device)
+                / float(dim)
+            )
+        )
+        return inv_freq, 1.0
+
+    modeling_rope_utils.ROPE_INIT_FUNCTIONS["default"] = qwen_default_rope_parameters
+
+
+def prepare_qwen_runtime(src_dir: Path, repo_url: str) -> None:
+    qwen_src_dir = ensure_qwen_source(src_dir, repo_url)
+    if str(qwen_src_dir) not in sys.path:
+        sys.path.insert(0, str(qwen_src_dir))
+    ensure_qwen_transformers_compat()
+
+
+def resolve_vllm_device(device: str) -> str:
+    if device == "cuda":
+        return "cuda:0"
+    if device.startswith("cuda:"):
+        _, _, raw_idx = device.partition(":")
+        if raw_idx.isdigit():
+            idx = int(raw_idx)
+            if idx == 0:
+                return "cuda:0"
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if visible and visible != raw_idx:
+                raise RuntimeError(
+                    "vLLM backend requires CUDA_VISIBLE_DEVICES to match the selected "
+                    f"device index. Got --device={device}, "
+                    f"CUDA_VISIBLE_DEVICES={visible!r}."
+                )
+            if not visible:
+                os.environ["CUDA_VISIBLE_DEVICES"] = raw_idx
+            return "cuda:0"
+    raise RuntimeError(
+        f"vLLM backend requires a CUDA device, got {device!r}. "
+        "Use --asr-engine sensevoice for CPU runs."
+    )
 
 
 def _apply_lfr(inputs: torch.Tensor, lfr_m: int, lfr_n: int) -> torch.Tensor:
@@ -362,14 +475,15 @@ def build_asr_model(
     resolved_device: str,
     segment_batch_size: int,
 ) -> Any:
-    backend = config.asr_backend.strip().lower()
-    if backend == "vllm":
-        raise RuntimeError(
-            "SenseVoice backend does not support vLLM. "
-            "Use --asr-backend sensevoice (or transformers alias)."
+    engine = config.asr_engine.strip().lower()
+    if engine == "qwen3":
+        return build_asr_model_qwen_vllm(
+            config,
+            resolved_device,
+            segment_batch_size,
         )
-    if backend not in {"sensevoice", "transformers"}:
-        raise ValueError(f"Unsupported ASR backend: {config.asr_backend}")
+    if engine != "sensevoice":
+        raise ValueError(f"Unsupported ASR engine: {config.asr_engine}")
     return build_asr_model_sensevoice(
         config,
         resolved_device,
@@ -425,3 +539,111 @@ def build_vad_model(
         max_single_segment_time=vad_max_segment_ms,
         max_end_silence_time=vad_max_end_silence_ms,
     )
+
+
+class Qwen3VLLMFastWrapper:
+    """Wraps Qwen3ASRModel to skip redundant audio normalization and prompt
+    construction.  The pipeline already provides 16 kHz mono float32 segments,
+    and all segments share the same context/language, so the prompt template
+    is built once and reused.
+    """
+
+    def __init__(self, inner: Any, *, context: str, language: str) -> None:
+        self.inner = inner
+        self._cached_prompt: str | None = None
+        self._cache_key: tuple[str, str | None] = ("", None)
+        self._context = context
+        self._language = language
+
+    def _resolve_prompt(self, context: str, language: str | None) -> str:
+        key = (context, language)
+        if key == self._cache_key and self._cached_prompt is not None:
+            return self._cached_prompt
+        prompt = self.inner._build_text_prompt(
+            context=context, force_language=language,
+        )
+        self._cached_prompt = prompt
+        self._cache_key = key
+        return prompt
+
+    def transcribe(
+        self,
+        *,
+        audio: list[tuple[Any, int]],
+        context: str = "",
+        language: str = "",
+    ) -> list[ASRResult]:
+        if not audio:
+            return []
+
+        effective_language = language.strip() or self._language or None
+        effective_context = context.strip() or self._context
+
+        prompt = self._resolve_prompt(effective_context, effective_language)
+
+        from qwen_asr.inference.utils import (
+            detect_and_fix_repetitions,
+            parse_asr_output,
+        )
+
+        waveforms = [samples for samples, _sr in audio]
+        inputs = [
+            {"prompt": prompt, "multi_modal_data": {"audio": [w]}}
+            for w in waveforms
+        ]
+
+        batch_size = self.inner.max_inference_batch_size
+        if batch_size is None or batch_size < 0:
+            batch_size = len(inputs)
+
+        results: list[ASRResult] = []
+        for i in range(0, len(inputs), batch_size):
+            batch = inputs[i : i + batch_size]
+            outputs = self.inner.model.generate(
+                batch,
+                sampling_params=self.inner.sampling_params,
+                use_tqdm=False,
+            )
+            for o in outputs:
+                raw = o.outputs[0].text
+                _lang, txt = parse_asr_output(raw, user_language=effective_language)
+                results.append(ASRResult(text=txt))
+        return results
+
+
+def build_asr_model_qwen_vllm(
+    config: TranscribeConfig,
+    resolved_device: str,
+    segment_batch_size: int,
+) -> Qwen3VLLMFastWrapper:
+    if not resolved_device.startswith("cuda"):
+        raise RuntimeError(
+            f"Qwen3 vLLM requires CUDA, got resolved device {resolved_device!r}. "
+            "Use --asr-engine sensevoice on CPU."
+        )
+    resolve_vllm_device(resolved_device)
+    prepare_qwen_runtime(config.qwen_src_dir, config.qwen_repo_url)
+    try:
+        from qwen_asr import Qwen3ASRModel
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Failed to import Qwen3ASRModel for vLLM backend. "
+            "Install dependencies with `pip install -U qwen-asr[vllm] vllm`."
+        ) from exc
+
+    inner = Qwen3ASRModel.LLM(
+        model=config.qwen_model,
+        gpu_memory_utilization=config.vllm_gpu_memory_utilization,
+        tensor_parallel_size=config.vllm_tensor_parallel_size,
+        max_inference_batch_size=segment_batch_size,
+        max_new_tokens=config.qwen_max_new_tokens,
+        max_model_len=config.vllm_max_model_len,
+        max_num_seqs=config.vllm_max_num_seqs,
+        disable_log_stats=True,
+    )
+
+    context = config.qwen_context.strip() if config.use_prompt else ""
+    from qwen_asr.inference.utils import normalize_language_name
+
+    language = normalize_language_name(config.qwen_language)
+    return Qwen3VLLMFastWrapper(inner, context=context, language=language)
