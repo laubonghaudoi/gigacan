@@ -1090,7 +1090,11 @@ def transcribe_batch_to_srt_superbatched(
                 estimated = estimate_file_decode_bytes(job.audio)
                 reserved_bytes = try_reserve_decoded_budget(estimated)
                 while reserved_bytes is None:
-                    drain_jobs(block=True)
+                    if pending_jobs:
+                        drain_jobs(block=True)
+                    else:
+                        with decoded_budget_cv:
+                            decoded_budget_cv.wait(timeout=1.0)
                     reserved_bytes = try_reserve_decoded_budget(estimated)
 
                 try:

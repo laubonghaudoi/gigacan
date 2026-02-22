@@ -28,6 +28,8 @@
 用 `tmux` 跑生產腳本，會自動記錄 GPU/RAM/進度：
 
 ```bash
+nvidia-settings -a "[gpu:0]/GPUGraphicsClockOffsetAllPerformanceLevels=200"
+nvidia-settings -a "[gpu:0]/GPUMemoryTransferRateOffsetAllPerformanceLevels=4400"
 # Qwen3-ASR 1.7B + vLLM（預設，質素最好）
 tmux new -s transcribe './run_production.sh'
 
@@ -41,6 +43,10 @@ tmux new -s transcribe './run_production.sh sensevoice'
 
 ```bash
 tmux attach -t transcribe
+
+# If you are attached to tmux, press Ctrl+C once in that pane to stop
+# If detached, run:
+tmux send-keys -t transcribe:0 C-c
 ```
 
 按 `Ctrl+B` 然後 `D` 可以 detach 返出嚟（唔會中斷任務）。
@@ -52,6 +58,13 @@ tail -f benchmarks/production_*/monitor.log
 ```
 
 如果中斷咗，直接重新跑返就得，已轉寫嘅會自動跳過，VAD 結果亦有 cache。
+
+- 錶格
+- 咧
+- 嚇
+- 禁制
+- 咁
+- 曬
 
 ### 最優預設參數
 

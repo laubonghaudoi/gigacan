@@ -18,6 +18,7 @@ FFMPEG_CMD_BASE = [
 VAD_CHUNK_SECONDS = 600
 VAD_CHUNK_SAMPLES = VAD_CHUNK_SECONDS * TARGET_SAMPLE_RATE
 VAD_CHUNK_BYTES = VAD_CHUNK_SAMPLES * 4  # float32
+MIN_VAD_SAMPLES = TARGET_SAMPLE_RATE // 2  # 0.5 s — minimum for FSMN feature extraction
 
 
 def _ffmpeg_decode_cmd(audio_path: Path) -> list[str]:
@@ -42,14 +43,24 @@ def _ffmpeg_decode_cmd(audio_path: Path) -> list[str]:
 def load_audio_mono_16k(audio_path: Path) -> tuple[np.ndarray, int]:
     """Load audio as mono 16kHz float32 samples.
 
-    Uses ffmpeg to decode directly to 16kHz mono, avoiding the massive
-    intermediate buffers that torchaudio creates when loading at the
-    original sample rate (e.g. 48kHz stereo → ~14 GB for a 10h file).
+    Reads ffmpeg output in chunks to avoid subprocess.run's internal
+    buffering which doubles peak memory (subprocess buffer + numpy copy).
     """
-    proc = subprocess.run(
-        _ffmpeg_decode_cmd(audio_path), check=True, stdout=subprocess.PIPE,
+    proc = subprocess.Popen(
+        _ffmpeg_decode_cmd(audio_path),
+        stdout=subprocess.PIPE,
     )
-    audio = np.frombuffer(proc.stdout, dtype=np.float32).copy()
+    assert proc.stdout is not None
+    chunks: list[np.ndarray] = []
+    while True:
+        raw = proc.stdout.read(VAD_CHUNK_BYTES)
+        if not raw:
+            break
+        chunks.append(np.frombuffer(raw, dtype=np.float32).copy())
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, proc.args)
+    audio = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
     return audio, TARGET_SAMPLE_RATE
 
 
@@ -97,12 +108,13 @@ def load_audio_and_vad_streaming(
             break
         chunks.append(chunk)
 
-        vad_res = vad_model.generate(input=chunk)
-        if vad_res and "value" in vad_res[0]:
-            for start, end in vad_res[0]["value"]:
-                raw_segments.append(
-                    (int(start) + offset_ms, int(end) + offset_ms)
-                )
+        if len(chunk) >= MIN_VAD_SAMPLES:
+            vad_res = vad_model.generate(input=chunk)
+            if vad_res and "value" in vad_res[0]:
+                for start, end in vad_res[0]["value"]:
+                    raw_segments.append(
+                        (int(start) + offset_ms, int(end) + offset_ms)
+                    )
 
         offset_ms += len(chunk) * 1000 // TARGET_SAMPLE_RATE
 
@@ -159,12 +171,13 @@ def compute_vad_streaming(
         if chunk is None:
             break
 
-        vad_res = vad_model.generate(input=chunk)
-        if vad_res and "value" in vad_res[0]:
-            for start, end in vad_res[0]["value"]:
-                raw_segments.append(
-                    (int(start) + offset_ms, int(end) + offset_ms)
-                )
+        if len(chunk) >= MIN_VAD_SAMPLES:
+            vad_res = vad_model.generate(input=chunk)
+            if vad_res and "value" in vad_res[0]:
+                for start, end in vad_res[0]["value"]:
+                    raw_segments.append(
+                        (int(start) + offset_ms, int(end) + offset_ms)
+                    )
 
         offset_ms += len(chunk) * 1000 // TARGET_SAMPLE_RATE
         del chunk
